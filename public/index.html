@@ -1,171 +1,28 @@
-<!DOCTYPE html>
-<html lang="hi">
+<!doctype html>
+<html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Video Gallery</title>
-<style>
-  :root {
-    --bg: #0f1115;
-    --card: #1a1d24;
-    --accent: #ff5a3c;
-    --text: #f2f2f2;
-    --muted: #9aa0a8;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
-    background:
-      radial-gradient(circle at 20% 10%, rgba(255,90,60,0.12), transparent 40%),
-      radial-gradient(circle at 80% 90%, rgba(90,140,255,0.10), transparent 40%),
-      var(--bg);
-    color: var(--text);
-    perspective: 1200px;
-  }
-  header {
-    padding: 20px 16px;
-    text-align: center;
-    border-bottom: 1px solid #22252c;
-    position: sticky;
-    top: 0;
-    background: rgba(15,17,21,0.85);
-    backdrop-filter: blur(8px);
-    z-index: 5;
-  }
-  header h1 {
-    margin: 0;
-    font-size: 22px;
-    letter-spacing: 0.5px;
-    text-shadow: 0 2px 0 rgba(0,0,0,0.4), 0 6px 14px rgba(255,90,60,0.25);
-  }
-  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
-  .grid {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 20px;
-    padding: 20px 16px 60px;
-    max-width: 700px;
-    margin: 0 auto;
-  }
-  @media (min-width: 700px) {
-    .grid { grid-template-columns: 1fr 1fr; }
-  }
-  .card {
-    background: linear-gradient(145deg, #1f232b, #14161b);
-    border-radius: 16px;
-    overflow: hidden;
-    border: 1px solid #262a33;
-    transform-style: preserve-3d;
-    transform: perspective(800px) rotateX(0deg) rotateY(0deg) translateZ(0);
-    box-shadow:
-      0 10px 20px rgba(0,0,0,0.35),
-      0 2px 4px rgba(0,0,0,0.25);
-    transition: transform 0.15s ease-out, box-shadow 0.15s ease-out;
-    will-change: transform;
-  }
-  .card.tilt-active {
-    box-shadow:
-      0 20px 40px rgba(0,0,0,0.45),
-      0 6px 12px rgba(255,90,60,0.15);
-  }
-  .card video {
-    width: 100%;
-    display: block;
-    background: #000;
-    max-height: 420px;
-    transform: translateZ(20px);
-  }
-  .card .body { padding: 14px 16px; transform: translateZ(10px); }
-  .card p { margin: 0; line-height: 1.4; font-size: 15px; white-space: pre-wrap; }
-  .card .date { color: var(--muted); font-size: 12px; margin-top: 8px; display: block; }
-  .empty {
-    text-align: center;
-    color: var(--muted);
-    padding: 60px 20px;
-  }
-  .loader {
-    text-align: center;
-    color: var(--muted);
-    padding: 40px;
-  }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#090a0d">
+  <meta name="description" content="Discover fresh and trending videos on Vistara.">
+  <meta property="og:type" content="website"><meta property="og:title" content="Vistara — Watch something remarkable"><meta property="og:description" content="Fresh stories, bold creators, zero clutter.">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="canonical" id="canonical" href="/">
+  <link rel="stylesheet" href="/styles.css">
+  <title>Vistara — Watch something remarkable</title>
 </head>
 <body>
-  <header>
-    <h1>📹 Video Gallery</h1>
-    <p>Latest uploads</p>
+  <header class="topbar">
+    <a class="brand" href="/" data-link><span class="brand-mark">V</span>Vistara</a>
+    <form class="search" id="searchForm" role="search"><input id="searchInput" name="q" type="search" placeholder="Search videos, categories, tags" autocomplete="off"><button aria-label="Search">Search</button></form>
+    <button class="icon-btn" id="themeBtn" aria-label="Toggle theme">◐</button>
   </header>
-
-  <div id="content" class="loader">Loading...</div>
-
-  <script>
-    async function loadVideos() {
-      const el = document.getElementById('content');
-      try {
-        const res = await fetch('/api/videos');
-        const videos = await res.json();
-
-        if (!videos.length) {
-          el.className = 'empty';
-          el.innerHTML = 'Abhi tak koi video upload nahi hui.';
-          return;
-        }
-
-        el.className = 'grid';
-        el.innerHTML = videos.map(v => `
-          <div class="card">
-            <video controls preload="metadata" poster="${v.thumbnailUrl || ''}">
-              <source src="${v.videoUrl}" type="video/mp4">
-            </video>
-            <div class="body">
-              <p>${escapeHtml(v.description)}</p>
-              <span class="date">${new Date(v.createdAt).toLocaleString('hi-IN')}</span>
-            </div>
-          </div>
-        `).join('');
-
-        applyTiltEffect();
-      } catch (err) {
-        el.className = 'empty';
-        el.innerHTML = 'Videos load nahi ho paayi. Baad me try karein.';
-      }
-    }
-
-    function escapeHtml(str) {
-      const d = document.createElement('div');
-      d.textContent = str;
-      return d.innerHTML;
-    }
-
-    // Card par mouse/finger move karne se halka 3D tilt
-    function applyTiltEffect() {
-      document.querySelectorAll('.card').forEach(card => {
-        const maxTilt = 6; // degrees
-
-        const handleMove = (x, y) => {
-          const rect = card.getBoundingClientRect();
-          const px = (x - rect.left) / rect.width - 0.5;
-          const py = (y - rect.top) / rect.height - 0.5;
-          card.style.transform = `perspective(800px) rotateX(${(-py * maxTilt).toFixed(2)}deg) rotateY(${(px * maxTilt).toFixed(2)}deg) translateZ(10px)`;
-          card.classList.add('tilt-active');
-        };
-        const reset = () => {
-          card.style.transform = 'perspective(800px) rotateX(0deg) rotateY(0deg) translateZ(0)';
-          card.classList.remove('tilt-active');
-        };
-
-        card.addEventListener('mousemove', (e) => handleMove(e.clientX, e.clientY));
-        card.addEventListener('mouseleave', reset);
-        card.addEventListener('touchmove', (e) => {
-          const t = e.touches[0];
-          handleMove(t.clientX, t.clientY);
-        }, { passive: true });
-        card.addEventListener('touchend', reset);
-      });
-    }
-
-    loadVideos();
-  </script>
+  <nav class="nav" aria-label="Primary">
+    <a href="/" data-link>Home</a><a href="/latest" data-link>Latest</a><a href="/trending" data-link>Trending</a><a href="/categories" data-link>Categories</a>
+  </nav>
+  <main id="app" tabindex="-1"><div class="loading-page"><span class="spinner"></span><p>Loading the good stuff…</p></div></main>
+  <footer><a class="brand" href="/" data-link><span class="brand-mark">V</span>Vistara</a><p>Fresh stories. Bold creators. Zero clutter.</p><p>© 2026 Vistara</p></footer>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
 </body>
 </html>

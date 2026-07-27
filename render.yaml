@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: video-web
+    runtime: node
+    plan: free
+    region: virginia
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SITE_URL
+        value: https://video-web-0xif.onrender.com
+      - key: TRUST_PROXY
+        value: "1"
+      - key: B2_ENDPOINT
+        value: https://s3.us-east-005.backblazeb2.com
+      - key: B2_REGION
+        value: us-east-005
+      - key: B2_BUCKET
+        value: anulove
+      - key: SIGNED_URL_TTL_SECONDS
+        value: "14400"
+      - key: UPLOAD_PASSWORD
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: B2_KEY_ID
+        sync: false
+      - key: B2_APPLICATION_KEY
+        sync: false
