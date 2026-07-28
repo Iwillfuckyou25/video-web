@@ -60,6 +60,7 @@ function notFound(){setMeta('Page not found');app.innerHTML=`<div class="empty">
 async function router(){
   document.onkeydown=null;state.page=Number(new URLSearchParams(location.search).get('page'))||1;activateNav();scrollTo(0,0);const p=location.pathname;
   try{if(p==='/')await home();else if(p==='/latest')await listing('Latest videos');else if(p==='/trending')await listing('Trending', '&sort=trending');else if(p==='/categories')await allCategories();else if(p.startsWith('/category/')){const name=decodeURIComponent(p.split('/').pop()).replace(/-/g,' ');await listing(`${name.replace(/\b\w/g,c=>c.toUpperCase())} videos`,`&category=${encodeURIComponent(name)}`)}else if(p==='/search'){const q=new URLSearchParams(location.search).get('q')||'';document.querySelector('#searchInput').value=q;await listing(`Results for “${q}”`,`&q=${encodeURIComponent(q)}`)}else if(p.startsWith('/watch/'))await watch(p.split('/').pop());else if(p==='/admin')await admin();else if(p==='/admin/upload')uploadView();else if(p.startsWith('/admin/video/'))await editVideo(p.split('/').pop());else notFound()}catch(e){console.error(e);app.innerHTML=`<div class="empty"><h1>Couldn’t load this page</h1><p>${esc(e.message)}</p><button class="button" onclick="location.reload()">Try again</button></div>`}
+  window.trackPageView?.();
   app.focus({preventScroll:true});
 }
 function navigate(url){history.pushState({},'',url);router()}
