@@ -8,8 +8,10 @@
     const video = document.querySelector('#videoPlayer');
     const shell = document.querySelector('#playerShell');
     if (!video || !shell) return;
+    const sources = videoData.sources?.length ? videoData.sources : [{ label: 'Original', url: videoData.videoUrl }];
 
     video.controls = false;
+    video.src = sources[0].url;
     video.preload = 'auto';
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
@@ -24,7 +26,7 @@
           <input class="pro-volume" data-control="volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume">
           <span class="pro-time">0:00 / 0:00</span>
           <span class="pro-spacer"></span>
-          <select data-control="quality" aria-label="Video quality"><option>Original</option></select>
+          <select data-control="quality" aria-label="Video quality">${sources.map((source, index) => `<option value="${index}">${source.label}</option>`).join('')}</select>
           <select data-control="speed" aria-label="Playback speed">
             <option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="0.75">0.75x</option>
             <option value="1" selected>1x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2x</option>
@@ -87,6 +89,15 @@
     volume.addEventListener('input', () => { video.volume = Number(volume.value); video.muted = false; mute.textContent = video.volume ? '🔊' : '🔇'; });
     mute.addEventListener('click', event => { event.stopPropagation(); video.muted = !video.muted; mute.textContent = video.muted ? '🔇' : '🔊'; });
     shell.querySelector('[data-control="speed"]').addEventListener('change', event => { video.playbackRate = Number(event.target.value); });
+    shell.querySelector('[data-control="quality"]').addEventListener('change', event => {
+      const next = sources[Number(event.target.value)];
+      if (!next || next.url === video.src) return;
+      const currentTime = video.currentTime;
+      const wasPlaying = !video.paused;
+      video.src = next.url;
+      video.load();
+      video.addEventListener('loadedmetadata', () => { video.currentTime = Math.min(currentTime, video.duration || currentTime); if (wasPlaying) video.play(); }, { once: true });
+    });
     shell.querySelector('[data-control="pip"]').addEventListener('click', async event => {
       event.stopPropagation();
       if (!document.pictureInPictureEnabled) return window.showToast?.('PiP is not supported on this device');

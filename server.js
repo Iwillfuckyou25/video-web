@@ -13,6 +13,8 @@ const os = require('os');
 const fs = require('fs');
 const { unlink } = require('fs/promises');
 const { randomUUID } = require('crypto');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -45,14 +47,26 @@ const signedObjectUrl = key => getSignedUrl(b2, new GetObjectCommand({ Bucket: B
 const withSignedUrls = async video => {
   const value = video?.toObject ? video.toObject() : { ...video };
   if (!value.videoKey || !value.thumbnailKey) return value;
-  const [videoUrl, thumbnailUrl] = await Promise.all([signedObjectUrl(value.videoKey), signedObjectUrl(value.thumbnailKey)]);
-  return { ...value, videoUrl, thumbnailUrl };
+  const storedSources = value.sources?.length ? value.sources : [{ label: 'Original', key: value.videoKey }];
+  const [thumbnailUrl, sources] = await Promise.all([
+    signedObjectUrl(value.thumbnailKey),
+    Promise.all(storedSources.map(async source => ({ label: source.label, url: await signedObjectUrl(source.key) }))),
+  ]);
+  return { ...value, videoUrl: sources[0].url, thumbnailUrl, sources };
 };
 const deleteB2Objects = async keys => {
   const Objects = keys.filter(Boolean).map(Key => ({ Key }));
   if (Objects.length) await b2.send(new DeleteObjectsCommand({ Bucket: B2_BUCKET, Delete: { Objects, Quiet: true } }));
 };
 const placeholderThumbnail = title => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540"><rect width="960" height="540" fill="#111318"/><circle cx="480" cy="240" r="58" fill="#ff4d36"/><path d="M462 205v70l58-35z" fill="white"/><text x="480" y="360" fill="white" font-family="Arial,sans-serif" font-size="30" text-anchor="middle">${String(title).replace(/[&<>"']/g, '')}</text></svg>`);
+const transcodeVideo = (input, output, height, maxRate, audioRate, crf) => new Promise((resolve, reject) => {
+  const args = ['-y', '-i', input, '-map', '0:v:0', '-map', '0:a?', '-vf', `scale=-2:${height}:force_original_aspect_ratio=decrease`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', String(crf), '-maxrate', maxRate, '-bufsize', `${parseInt(maxRate, 10) * 2}k`, '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', audioRate, '-movflags', '+faststart', output];
+  const process = spawn(ffmpegPath, args, { windowsHide: true });
+  let details = '';
+  process.stderr.on('data', chunk => { details = `${details}${chunk}`.slice(-4000); });
+  process.on('error', reject);
+  process.on('close', code => code === 0 ? resolve() : reject(new Error(`Video optimization failed (${code}): ${details}`)));
+});
 
 const videoSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true, maxlength: 140 },
@@ -60,6 +74,7 @@ const videoSchema = new mongoose.Schema({
   category: { type: String, required: true, trim: true, maxlength: 60, index: true },
   tags: [{ type: String, trim: true, maxlength: 40 }], duration: { type: Number, default: 0, min: 0 },
   videoKey: { type: String, required: true }, thumbnailKey: { type: String, required: true },
+  sources: [{ label: { type: String, required: true }, key: { type: String, required: true } }],
   views: { type: Number, default: 0, min: 0, index: true }, likes: { type: Number, default: 0, min: 0 },
   uploadDate: { type: Date, default: Date.now, index: true }, createdBy: { type: String, default: 'Admin' },
   status: { type: String, enum: ['draft', 'published'], default: 'published', index: true },
@@ -110,20 +125,25 @@ app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { con
 
 app.post('/api/upload', uploadLimiter, uploadFields, requireAdmin, async (req, res, next) => {
   let uploadedKeys = [];
+  let generatedFiles = [];
   try {
     const videoFile = req.files?.video?.[0], thumbnailFile = req.files?.thumbnail?.[0];
     if (!videoFile || !req.body.title?.trim() || !req.body.description?.trim() || !req.body.category?.trim()) return res.status(400).json({ error: 'Title, description, category and video are required' });
-    const id = randomUUID(), videoKey = `videos/${id}${extensionFor(videoFile.originalname, videoFile.mimetype, '.mp4')}`;
+    const id = randomUUID(), video480Key = `videos/${id}-480p.mp4`, video720Key = `videos/${id}-720p.mp4`;
     const thumbKey = `thumbnails/${id}${thumbnailFile ? extensionFor(thumbnailFile.originalname, thumbnailFile.mimetype, '.jpg') : '.svg'}`;
-    const videoObject = await putB2Object({ key: videoKey, body: fs.createReadStream(videoFile.path), contentType: videoFile.mimetype }); uploadedKeys.push(videoKey);
+    const output480 = path.join(os.tmpdir(), `${id}-480p.mp4`), output720 = path.join(os.tmpdir(), `${id}-720p.mp4`); generatedFiles = [output480, output720];
+    await transcodeVideo(videoFile.path, output480, 480, '900k', '64k', 29);
+    await transcodeVideo(videoFile.path, output720, 720, '1800k', '96k', 27);
+    await putB2Object({ key: video480Key, body: fs.createReadStream(output480), contentType: 'video/mp4' }); uploadedKeys.push(video480Key);
+    await putB2Object({ key: video720Key, body: fs.createReadStream(output720), contentType: 'video/mp4' }); uploadedKeys.push(video720Key);
     const thumbObject = await putB2Object({ key: thumbKey, body: thumbnailFile ? fs.createReadStream(thumbnailFile.path) : placeholderThumbnail(req.body.title), contentType: thumbnailFile?.mimetype || 'image/svg+xml' }); uploadedKeys.push(thumbKey);
-    const video = await Video.create({ title: clean(req.body.title, 140), description: clean(req.body.description), category: clean(req.body.category, 60), tags: String(req.body.tags || '').split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20), duration: Math.max(0, Number(req.body.duration) || 0), videoKey: videoObject.key, thumbnailKey: thumbObject.key, status: req.body.status === 'draft' ? 'draft' : 'published' });
+    const video = await Video.create({ title: clean(req.body.title, 140), description: clean(req.body.description), category: clean(req.body.category, 60), tags: String(req.body.tags || '').split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20), duration: Math.max(0, Number(req.body.duration) || 0), videoKey: video480Key, thumbnailKey: thumbObject.key, sources: [{ label: '480p', key: video480Key }, { label: '720p', key: video720Key }], status: req.body.status === 'draft' ? 'draft' : 'published' });
     res.status(201).json(await withSignedUrls(video));
   } catch (error) { await deleteB2Objects(uploadedKeys).catch(() => {}); next(error); }
-  finally { await Promise.all(Object.values(req.files || {}).flat().map(file => file.path ? unlink(file.path).catch(() => {}) : null)); }
+  finally { await Promise.all([...Object.values(req.files || {}).flat().map(file => file.path), ...generatedFiles].filter(Boolean).map(file => unlink(file).catch(() => {}))); }
 });
 app.put('/api/videos/:id', requireAdmin, async (req, res) => { try { const update = {}; ['title', 'description', 'category', 'status'].forEach(key => { if (req.body[key] != null) update[key] = clean(req.body[key], key === 'description' ? 2000 : 140); }); if (req.body.tags != null) update.tags = String(req.body.tags).split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20); const video = await Video.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true }); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json(video); } catch (error) { res.status(400).json({ error: error.message }); } });
-app.delete('/api/videos/:id', requireAdmin, async (req, res, next) => { try { const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([video.videoKey, video.thumbnailKey]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
+app.delete('/api/videos/:id', requireAdmin, async (req, res, next) => { try { const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([...new Set([video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)])]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
 
 app.get('/robots.txt', (_req, res) => res.type('text').send(`User-agent: *\nAllow: /\nDisallow: /admin\nSitemap: ${SITE_URL}/sitemap.xml`));
 app.get('/sitemap.xml', async (_req, res) => { const videos = await Video.find({ status: 'published' }).select('_id').lean(); const urls = ['', '/latest', '/trending', '/categories', ...videos.map(v => `/watch/${v._id}`)]; res.type('xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/sitemap/0.9">${urls.map(url => `<url><loc>${SITE_URL}${url}</loc></url>`).join('')}</urlset>`); });
