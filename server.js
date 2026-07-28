@@ -69,7 +69,6 @@ const Video = mongoose.model('Video', videoSchema);
 
 app.disable('x-powered-by');
 app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
-mongoose.set('sanitizeFilter', true);
 mongoose.set('strictQuery', true);
 app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], mediaSrc: ["'self'", 'https:'], connectSrc: ["'self'", 'https:'], objectSrc: ["'none'"], baseUri: ["'self'"], frameAncestors: ["'none'"] } }, crossOriginResourcePolicy: { policy: 'cross-origin' }, referrerPolicy: { policy: 'strict-origin-when-cross-origin' } }));
 app.use(compression());
@@ -94,13 +93,14 @@ app.get('/api/videos', async (req, res, next) => { try {
   const [items, total] = await Promise.all([Video.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).lean(), Video.countDocuments(filter)]);
   res.json({ items: await Promise.all(items.map(withSignedUrls)), page, pages: Math.ceil(total / limit), total });
 } catch (error) { next(error); } });
-app.get('/api/videos/:id', async (req, res) => { try {
+app.get('/api/videos/:id', async (req, res, next) => { try {
+  if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' });
   const video = await Video.findOneAndUpdate({ _id: req.params.id, status: 'published' }, { $inc: { views: 1 } }, { new: true }).lean();
   if (!video) return res.status(404).json({ error: 'Video not found' });
   let related = await Video.find({ _id: { $ne: video._id }, status: 'published', $or: [{ category: video.category }, { tags: { $in: video.tags || [] } }] }).sort({ uploadDate: -1 }).limit(8).lean();
   if (!related.length) related = await Video.find({ _id: { $ne: video._id }, status: 'published' }).sort({ uploadDate: -1 }).limit(8).lean();
   res.json({ video: await withSignedUrls(video), related: await Promise.all(related.map(withSignedUrls)) });
-} catch (_error) { res.status(400).json({ error: 'Invalid video id' }); } });
+} catch (error) { next(error); } });
 app.get('/api/categories', async (_req, res, next) => { try {
   const items = await Video.aggregate([{ $match: { status: 'published' } }, { $group: { _id: '$category', count: { $sum: 1 }, views: { $sum: '$views' }, thumbnailKey: { $first: '$thumbnailKey' } } }, { $sort: { count: -1 } }]);
   res.json(await Promise.all(items.map(async x => ({ name: x._id, slug: String(x._id).toLowerCase().replace(/[^a-z0-9]+/g, '-'), count: x.count, views: x.views, thumbnailUrl: x.thumbnailKey ? await signedObjectUrl(x.thumbnailKey) : '' }))));
