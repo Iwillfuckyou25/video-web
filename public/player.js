@@ -43,7 +43,6 @@
     const clock = shell.querySelector('.pro-time');
     const gesture = shell.querySelector('.gesture');
     const bubble = gesture?.querySelector('span');
-    let bufferTimer;
     let controlsTimer;
     let lastTap = 0;
     let seeking = false;
@@ -58,11 +57,6 @@
       clearTimeout(controlsTimer);
       if (!video.paused) controlsTimer = setTimeout(() => shell.classList.remove('controls-visible'), 2800);
     };
-    const setBuffering = active => {
-      clearTimeout(bufferTimer);
-      if (active) bufferTimer = setTimeout(() => shell.classList.add('buffering'), 500);
-      else shell.classList.remove('buffering');
-    };
     const flash = text => {
       if (!gesture || !bubble) return;
       bubble.textContent = text;
@@ -74,10 +68,10 @@
     video.addEventListener('click', togglePlay);
     video.addEventListener('play', syncPlay);
     video.addEventListener('pause', () => { syncPlay(); showControls(); });
-    video.addEventListener('waiting', () => setBuffering(true));
-    video.addEventListener('stalled', () => setBuffering(true));
-    video.addEventListener('playing', () => { setBuffering(false); syncPlay(); showControls(); });
-    video.addEventListener('canplay', () => setBuffering(false));
+    video.addEventListener('waiting', () => shell.classList.remove('buffering'));
+    video.addEventListener('stalled', () => shell.classList.remove('buffering'));
+    video.addEventListener('playing', () => { shell.classList.remove('buffering'); syncPlay(); showControls(); });
+    video.addEventListener('canplay', () => shell.classList.remove('buffering'));
     video.addEventListener('loadedmetadata', () => {
       clock.textContent = `0:00 / ${timeText(video.duration)}`;
       const saved = Number(localStorage.getItem(`resume:${videoData._id}`));
