@@ -77,10 +77,31 @@ const videoSchema = new mongoose.Schema({
   sources: [{ label: { type: String, required: true }, key: { type: String, required: true } }],
   views: { type: Number, default: 0, min: 0, index: true }, likes: { type: Number, default: 0, min: 0 },
   uploadDate: { type: Date, default: Date.now, index: true }, createdBy: { type: String, default: 'Admin' },
+  processingStatus: { type: String, enum: ['queued', 'processing', 'ready', 'failed'], default: 'queued' },
   status: { type: String, enum: ['draft', 'published'], default: 'published', index: true },
 }, { timestamps: true });
 videoSchema.index({ title: 'text', description: 'text', category: 'text', tags: 'text' });
 const Video = mongoose.model('Video', videoSchema);
+const processVideoVariants = async ({ videoId, inputPath, id }) => {
+  const output480 = path.join(os.tmpdir(), `${id}-480p.mp4`), output720 = path.join(os.tmpdir(), `${id}-720p.mp4`);
+  const key480 = `videos/${id}-480p.mp4`, key720 = `videos/${id}-720p.mp4`;
+  const createdKeys = [];
+  try {
+    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'processing' } });
+    await transcodeVideo(inputPath, output480, 480, '900k', '64k', 29);
+    await putB2Object({ key: key480, body: fs.createReadStream(output480), contentType: 'video/mp4' }); createdKeys.push(key480);
+    await transcodeVideo(inputPath, output720, 720, '1800k', '96k', 27);
+    await putB2Object({ key: key720, body: fs.createReadStream(output720), contentType: 'video/mp4' }); createdKeys.push(key720);
+    const video = await Video.findById(videoId).lean();
+    if (!video) return deleteB2Objects(createdKeys);
+    await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: key480 }, { label: '720p', key: key720 }, { label: 'Original', key: video.videoKey }], processingStatus: 'ready' } });
+  } catch (error) {
+    console.error(`Background video processing failed for ${videoId}:`, error.message);
+    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'failed' } }).catch(() => {});
+  } finally {
+    await Promise.all([inputPath, output480, output720].map(file => unlink(file).catch(() => {})));
+  }
+};
 
 app.disable('x-powered-by');
 app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
@@ -125,22 +146,20 @@ app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { con
 
 app.post('/api/upload', uploadLimiter, uploadFields, requireAdmin, async (req, res, next) => {
   let uploadedKeys = [];
-  let generatedFiles = [];
+  let backgroundStarted = false;
   try {
     const videoFile = req.files?.video?.[0], thumbnailFile = req.files?.thumbnail?.[0];
     if (!videoFile || !req.body.title?.trim() || !req.body.description?.trim() || !req.body.category?.trim()) return res.status(400).json({ error: 'Title, description, category and video are required' });
-    const id = randomUUID(), video480Key = `videos/${id}-480p.mp4`, video720Key = `videos/${id}-720p.mp4`;
+    const id = randomUUID(), originalKey = `videos/${id}-original${extensionFor(videoFile.originalname, videoFile.mimetype, '.mp4')}`;
     const thumbKey = `thumbnails/${id}${thumbnailFile ? extensionFor(thumbnailFile.originalname, thumbnailFile.mimetype, '.jpg') : '.svg'}`;
-    const output480 = path.join(os.tmpdir(), `${id}-480p.mp4`), output720 = path.join(os.tmpdir(), `${id}-720p.mp4`); generatedFiles = [output480, output720];
-    await transcodeVideo(videoFile.path, output480, 480, '900k', '64k', 29);
-    await transcodeVideo(videoFile.path, output720, 720, '1800k', '96k', 27);
-    await putB2Object({ key: video480Key, body: fs.createReadStream(output480), contentType: 'video/mp4' }); uploadedKeys.push(video480Key);
-    await putB2Object({ key: video720Key, body: fs.createReadStream(output720), contentType: 'video/mp4' }); uploadedKeys.push(video720Key);
+    await putB2Object({ key: originalKey, body: fs.createReadStream(videoFile.path), contentType: videoFile.mimetype }); uploadedKeys.push(originalKey);
     const thumbObject = await putB2Object({ key: thumbKey, body: thumbnailFile ? fs.createReadStream(thumbnailFile.path) : placeholderThumbnail(req.body.title), contentType: thumbnailFile?.mimetype || 'image/svg+xml' }); uploadedKeys.push(thumbKey);
-    const video = await Video.create({ title: clean(req.body.title, 140), description: clean(req.body.description), category: clean(req.body.category, 60), tags: String(req.body.tags || '').split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20), duration: Math.max(0, Number(req.body.duration) || 0), videoKey: video480Key, thumbnailKey: thumbObject.key, sources: [{ label: '480p', key: video480Key }, { label: '720p', key: video720Key }], status: req.body.status === 'draft' ? 'draft' : 'published' });
+    const video = await Video.create({ title: clean(req.body.title, 140), description: clean(req.body.description), category: clean(req.body.category, 60), tags: String(req.body.tags || '').split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20), duration: Math.max(0, Number(req.body.duration) || 0), videoKey: originalKey, thumbnailKey: thumbObject.key, sources: [{ label: 'Original', key: originalKey }], processingStatus: 'queued', status: req.body.status === 'draft' ? 'draft' : 'published' });
     res.status(201).json(await withSignedUrls(video));
+    backgroundStarted = true;
+    processVideoVariants({ videoId: video._id, inputPath: videoFile.path, id });
   } catch (error) { await deleteB2Objects(uploadedKeys).catch(() => {}); next(error); }
-  finally { await Promise.all([...Object.values(req.files || {}).flat().map(file => file.path), ...generatedFiles].filter(Boolean).map(file => unlink(file).catch(() => {}))); }
+  finally { await Promise.all(Object.values(req.files || {}).flat().map(file => file.path).filter(file => !backgroundStarted || file !== req.files?.video?.[0]?.path).map(file => unlink(file).catch(() => {}))); }
 });
 app.put('/api/videos/:id', requireAdmin, async (req, res) => { try { const update = {}; ['title', 'description', 'category', 'status'].forEach(key => { if (req.body[key] != null) update[key] = clean(req.body[key], key === 'description' ? 2000 : 140); }); if (req.body.tags != null) update.tags = String(req.body.tags).split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20); const video = await Video.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true }); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json(video); } catch (error) { res.status(400).json({ error: error.message }); } });
 app.delete('/api/videos/:id', requireAdmin, async (req, res, next) => { try { const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([...new Set([video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)])]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
