@@ -113,6 +113,8 @@ const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id 
     await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: key480 }, { label: 'Original', key: video.videoKey }] } });
     await putB2Object({ key: key720, body: fs.createReadStream(output720), contentType: 'video/mp4' }); createdKeys.push(key720);
     await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: key480 }, { label: '720p', key: key720 }, { label: 'Original', key: video.videoKey }], processingStatus: 'ready' } });
+    const staleVariantKeys = (video.sources || []).map(source => source.key).filter(key => key !== video.videoKey && !createdKeys.includes(key));
+    await deleteB2Objects(staleVariantKeys).catch(() => {});
   } catch (error) {
     console.error(`Background video processing failed for ${videoId}:`, error.message);
     await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'failed', processingError: clean(error.message, 500) } }).catch(() => {});
@@ -123,9 +125,10 @@ const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id 
 };
 const resumePendingProcessing = async () => {
   if (activeProcessing.size) return;
-  let video = await Video.findOne({ 'sources.1': { $exists: false }, processingStatus: { $in: ['queued', 'processing'] } }).sort({ uploadDate: 1 }).lean();
+  const missing720 = { $not: { $elemMatch: { label: '720p' } } };
+  let video = await Video.findOne({ sources: missing720, processingStatus: { $in: ['queued', 'processing'] } }).sort({ uploadDate: 1 }).lean();
   if (!video) video = await Video.findOne({
-    'sources.1': { $exists: false },
+    sources: missing720,
     $or: [
       { processingStatus: { $exists: false } },
       { processingStatus: 'failed', processingAttempts: { $lt: 3 } },
