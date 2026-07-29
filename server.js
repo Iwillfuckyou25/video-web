@@ -60,8 +60,13 @@ const deleteB2Objects = async keys => {
   if (Objects.length) await b2.send(new DeleteObjectsCommand({ Bucket: B2_BUCKET, Delete: { Objects, Quiet: true } }));
 };
 const placeholderThumbnail = title => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540"><rect width="960" height="540" fill="#111318"/><circle cx="480" cy="240" r="58" fill="#ff4d36"/><path d="M462 205v70l58-35z" fill="white"/><text x="480" y="360" fill="white" font-family="Arial,sans-serif" font-size="30" text-anchor="middle">${String(title).replace(/[&<>"']/g, '')}</text></svg>`);
-const transcodeVideo = (input, output, height, maxRate, audioRate, crf) => new Promise((resolve, reject) => {
-  const args = ['-y', '-i', input, '-map', '0:v:0', '-map', '0:a?', '-vf', `scale=-2:${height}:force_original_aspect_ratio=decrease`, '-c:v', 'libx264', '-preset', 'superfast', '-crf', String(crf), '-maxrate', maxRate, '-bufsize', `${parseInt(maxRate, 10) * 2}k`, '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', audioRate, '-movflags', '+faststart', output];
+const transcodeVideoVariants = (input, output480, output720) => new Promise((resolve, reject) => {
+  const filters = '[0:v:0]split=2[v480src][v720src];[v480src]scale=-2:480[v480];[v720src]scale=-2:720[v720]';
+  const args = [
+    '-y', '-i', input, '-filter_complex', filters,
+    '-map', '[v480]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '29', '-maxrate', '900k', '-bufsize', '1800k', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '64k', '-movflags', '+faststart', output480,
+    '-map', '[v720]', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '27', '-maxrate', '1800k', '-bufsize', '3600k', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', output720,
+  ];
   const process = spawn(ffmpegPath, args, { windowsHide: true });
   let details = '';
   process.stderr.on('data', chunk => { details = `${details}${chunk}`.slice(-4000); });
@@ -103,10 +108,9 @@ const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id 
       await pipeline(object.Body, fs.createWriteStream(inputPath));
     }
     await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'processing', processingError: '', processingStartedAt: new Date() }, $inc: { processingAttempts: 1 } });
-    await transcodeVideo(inputPath, output480, 480, '900k', '64k', 29);
+    await transcodeVideoVariants(inputPath, output480, output720);
     await putB2Object({ key: key480, body: fs.createReadStream(output480), contentType: 'video/mp4' }); createdKeys.push(key480);
     await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: key480 }, { label: 'Original', key: video.videoKey }] } });
-    await transcodeVideo(inputPath, output720, 720, '1800k', '96k', 27);
     await putB2Object({ key: key720, body: fs.createReadStream(output720), contentType: 'video/mp4' }); createdKeys.push(key720);
     await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: key480 }, { label: '720p', key: key720 }, { label: 'Original', key: video.videoKey }], processingStatus: 'ready' } });
   } catch (error) {
