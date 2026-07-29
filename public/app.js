@@ -9,6 +9,7 @@ const fmtDate = date => new Intl.DateTimeFormat('en', { dateStyle:'medium' }).fo
 const fmtViews = count => `${new Intl.NumberFormat('en', { notation:'compact' }).format(count || 0)} views`;
 const slug = text => String(text).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
 const showToast = message => { toast.textContent = message; toast.classList.add('show'); setTimeout(()=>toast.classList.remove('show'),2600); };
+window.showToast = showToast;
 const api = async (url, options={}) => { const res = await fetch(url, options); const data = await res.json(); if(!res.ok) throw new Error(data.error || 'Request failed'); return data; };
 const card = v => `<article class="video-card"><a href="/watch/${v._id}" data-link aria-label="Watch ${esc(v.title)}"><div class="thumb">${v.thumbnailUrl?`<img src="${esc(v.thumbnailUrl)}" alt="" loading="lazy">`:''}<span class="duration">${fmtTime(v.duration)}</span></div><div class="card-body"><div class="card-title">${esc(v.title || v.description)}</div><div class="meta"><span>${fmtViews(v.views)}</span><span>•</span><span>${fmtDate(v.uploadDate || v.createdAt)}</span><a class="category-pill" href="/category/${slug(v.category)}" data-link>${esc(v.category||'Video')}</a></div></div></a></article>`;
 const grid = items => items.length ? `<div class="video-grid">${items.map(card).join('')}</div>` : `<div class="empty"><h2>No videos found</h2><p>Try a different search or check back soon.</p></div>`;

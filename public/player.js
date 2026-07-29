@@ -174,9 +174,14 @@
     button.textContent = thumbInput.files[0] ? 'Preparing upload…' : 'Creating thumbnail…';
     const data = new FormData(form);
     try {
+      if (!videoFile) throw new Error('Please select a video first.');
       if (!thumbInput.files[0]) {
-        const thumbnail = await makeThumbnail(videoFile);
-        if (thumbnail) data.set('thumbnail', thumbnail, 'auto-thumbnail.jpg');
+        try {
+          const thumbnail = await makeThumbnail(videoFile);
+          if (thumbnail) data.set('thumbnail', thumbnail, 'auto-thumbnail.jpg');
+        } catch (_) {
+          window.showToast('Thumbnail could not be generated; uploading video with a placeholder.');
+        }
       }
       button.textContent = 'Uploading…';
       const xhr = new XMLHttpRequest();
@@ -186,14 +191,14 @@
       xhr.onload = () => {
         button.disabled = false;
         if (xhr.status === 201) { window.showToast?.('Video uploaded successfully'); history.pushState({}, '', '/admin'); window.dispatchEvent(new PopStateEvent('popstate')); }
-        else { button.textContent = 'Upload video'; try { window.showToast?.(JSON.parse(xhr.responseText).error || 'Upload failed'); } catch (_) {} }
+        else { button.textContent = 'Upload video'; let message=`Upload failed (${xhr.status})`;try{message=JSON.parse(xhr.responseText).error||message}catch(_){}window.showToast(message); }
       };
       xhr.onerror = () => { button.disabled = false; button.textContent = 'Upload video'; window.showToast?.('Network error'); };
       xhr.send(data);
-    } catch (_) {
+    } catch (error) {
       button.disabled = false;
       button.textContent = 'Upload video';
-      window.showToast?.('Could not create thumbnail. Please select one manually.');
+      window.showToast(error.message || 'Upload could not be started.');
     }
   }, true);
 })();
