@@ -22,6 +22,7 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.UPLOAD_PASSWORD;
 const SITE_URL = (process.env.SITE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const B2_BUCKET = process.env.B2_BUCKET;
+const PROCESSING_VERSION = 2;
 const SIGNED_URL_TTL = Math.min(86400, Math.max(300, Number(process.env.SIGNED_URL_TTL_SECONDS) || 14400));
 const required = ['UPLOAD_PASSWORD', 'MONGODB_URI', 'B2_ENDPOINT', 'B2_REGION', 'B2_KEY_ID', 'B2_APPLICATION_KEY', 'B2_BUCKET'];
 const missing = required.filter(key => !process.env[key]);
@@ -86,6 +87,7 @@ const videoSchema = new mongoose.Schema({
   processingStatus: { type: String, enum: ['queued', 'processing', 'ready', 'failed'], default: 'queued' },
   processingError: { type: String, default: '' }, processingStartedAt: Date,
   processingAttempts: { type: Number, default: 0, min: 0 },
+  processingVersion: { type: Number, default: 0, min: 0 },
   status: { type: String, enum: ['draft', 'published'], default: 'published', index: true },
 }, { timestamps: true });
 videoSchema.index({ title: 'text', description: 'text', category: 'text', tags: 'text' });
@@ -107,7 +109,8 @@ const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id 
       const object = await b2.send(new GetObjectCommand({ Bucket: B2_BUCKET, Key: video.videoKey }));
       await pipeline(object.Body, fs.createWriteStream(inputPath));
     }
-    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'processing', processingError: '', processingStartedAt: new Date() }, $inc: { processingAttempts: 1 } });
+    const processingAttempts = video.processingVersion === PROCESSING_VERSION ? (video.processingAttempts || 0) + 1 : 1;
+    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'processing', processingError: '', processingStartedAt: new Date(), processingAttempts, processingVersion: PROCESSING_VERSION } });
     await transcodeVideoVariants(inputPath, output480, output720);
     await putB2Object({ key: key480, body: fs.createReadStream(output480), contentType: 'video/mp4' }); createdKeys.push(key480);
     await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: key480 }, { label: 'Original', key: video.videoKey }] } });
@@ -131,8 +134,8 @@ const resumePendingProcessing = async () => {
     sources: missing720,
     $or: [
       { processingStatus: { $exists: false } },
-      { processingStatus: 'failed', processingAttempts: { $lt: 3 } },
-      { processingStatus: 'failed', processingAttempts: { $exists: false } },
+      { processingStatus: 'failed', processingVersion: { $ne: PROCESSING_VERSION } },
+      { processingStatus: 'failed', processingVersion: PROCESSING_VERSION, processingAttempts: { $lt: 3 } },
     ],
   }).sort({ uploadDate: 1 }).lean();
   if (video) processVideoVariants({ videoId: video._id, id: randomUUID() });
