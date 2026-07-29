@@ -119,7 +119,7 @@ const uploadLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { 
 const upload = multer({ storage: multer.diskStorage({ destination: os.tmpdir(), filename: (_req, file, cb) => cb(null, `${randomUUID()}${extensionFor(file.originalname, file.mimetype, '.bin')}`) }), limits: { fileSize: 500 * 1024 * 1024, files: 2 }, fileFilter: (_req, file, cb) => { const valid = file.fieldname === 'video' ? file.mimetype.startsWith('video/') : file.mimetype.startsWith('image/'); cb(valid ? null : new Error('Only valid video and image files are allowed'), valid); } });
 const uploadFields = upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]);
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, storage: 'b2' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, storage: 'b2', uploadMode: 'background-processing' }));
 app.get('/api/videos', async (req, res, next) => { try {
   const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(48, Math.max(1, Number(req.query.limit) || 12));
   const filter = { status: 'published' };
