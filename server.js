@@ -12,6 +12,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const { unlink } = require('fs/promises');
+const { pipeline } = require('stream/promises');
 const { randomUUID } = require('crypto');
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
@@ -60,7 +61,7 @@ const deleteB2Objects = async keys => {
 };
 const placeholderThumbnail = title => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540"><rect width="960" height="540" fill="#111318"/><circle cx="480" cy="240" r="58" fill="#ff4d36"/><path d="M462 205v70l58-35z" fill="white"/><text x="480" y="360" fill="white" font-family="Arial,sans-serif" font-size="30" text-anchor="middle">${String(title).replace(/[&<>"']/g, '')}</text></svg>`);
 const transcodeVideo = (input, output, height, maxRate, audioRate, crf) => new Promise((resolve, reject) => {
-  const args = ['-y', '-i', input, '-map', '0:v:0', '-map', '0:a?', '-vf', `scale=-2:${height}:force_original_aspect_ratio=decrease`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', String(crf), '-maxrate', maxRate, '-bufsize', `${parseInt(maxRate, 10) * 2}k`, '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', audioRate, '-movflags', '+faststart', output];
+  const args = ['-y', '-i', input, '-map', '0:v:0', '-map', '0:a?', '-vf', `scale=-2:${height}:force_original_aspect_ratio=decrease`, '-c:v', 'libx264', '-preset', 'superfast', '-crf', String(crf), '-maxrate', maxRate, '-bufsize', `${parseInt(maxRate, 10) * 2}k`, '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', audioRate, '-movflags', '+faststart', output];
   const process = spawn(ffmpegPath, args, { windowsHide: true });
   let details = '';
   process.stderr.on('data', chunk => { details = `${details}${chunk}`.slice(-4000); });
@@ -78,29 +79,56 @@ const videoSchema = new mongoose.Schema({
   views: { type: Number, default: 0, min: 0, index: true }, likes: { type: Number, default: 0, min: 0 },
   uploadDate: { type: Date, default: Date.now, index: true }, createdBy: { type: String, default: 'Admin' },
   processingStatus: { type: String, enum: ['queued', 'processing', 'ready', 'failed'], default: 'queued' },
+  processingError: { type: String, default: '' }, processingStartedAt: Date,
+  processingAttempts: { type: Number, default: 0, min: 0 },
   status: { type: String, enum: ['draft', 'published'], default: 'published', index: true },
 }, { timestamps: true });
 videoSchema.index({ title: 'text', description: 'text', category: 'text', tags: 'text' });
 const Video = mongoose.model('Video', videoSchema);
-const processVideoVariants = async ({ videoId, inputPath, id }) => {
+const activeProcessing = new Set();
+const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id }) => {
+  const lockId = String(videoId);
+  if (activeProcessing.size || activeProcessing.has(lockId)) return;
+  activeProcessing.add(lockId);
+  let inputPath = suppliedInputPath;
   const output480 = path.join(os.tmpdir(), `${id}-480p.mp4`), output720 = path.join(os.tmpdir(), `${id}-720p.mp4`);
   const key480 = `videos/${id}-480p.mp4`, key720 = `videos/${id}-720p.mp4`;
   const createdKeys = [];
   try {
-    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'processing' } });
+    const video = await Video.findById(videoId).lean();
+    if (!video) return;
+    if (!inputPath) {
+      inputPath = path.join(os.tmpdir(), `${id}-source${path.extname(video.videoKey) || '.mp4'}`);
+      const object = await b2.send(new GetObjectCommand({ Bucket: B2_BUCKET, Key: video.videoKey }));
+      await pipeline(object.Body, fs.createWriteStream(inputPath));
+    }
+    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'processing', processingError: '', processingStartedAt: new Date() }, $inc: { processingAttempts: 1 } });
     await transcodeVideo(inputPath, output480, 480, '900k', '64k', 29);
     await putB2Object({ key: key480, body: fs.createReadStream(output480), contentType: 'video/mp4' }); createdKeys.push(key480);
+    await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: key480 }, { label: 'Original', key: video.videoKey }] } });
     await transcodeVideo(inputPath, output720, 720, '1800k', '96k', 27);
     await putB2Object({ key: key720, body: fs.createReadStream(output720), contentType: 'video/mp4' }); createdKeys.push(key720);
-    const video = await Video.findById(videoId).lean();
-    if (!video) return deleteB2Objects(createdKeys);
     await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: key480 }, { label: '720p', key: key720 }, { label: 'Original', key: video.videoKey }], processingStatus: 'ready' } });
   } catch (error) {
     console.error(`Background video processing failed for ${videoId}:`, error.message);
-    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'failed' } }).catch(() => {});
+    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'failed', processingError: clean(error.message, 500) } }).catch(() => {});
   } finally {
     await Promise.all([inputPath, output480, output720].map(file => unlink(file).catch(() => {})));
+    activeProcessing.delete(lockId);
   }
+};
+const resumePendingProcessing = async () => {
+  if (activeProcessing.size) return;
+  let video = await Video.findOne({ 'sources.1': { $exists: false }, processingStatus: { $in: ['queued', 'processing'] } }).sort({ uploadDate: 1 }).lean();
+  if (!video) video = await Video.findOne({
+    'sources.1': { $exists: false },
+    $or: [
+      { processingStatus: { $exists: false } },
+      { processingStatus: 'failed', processingAttempts: { $lt: 3 } },
+      { processingStatus: 'failed', processingAttempts: { $exists: false } },
+    ],
+  }).sort({ uploadDate: 1 }).lean();
+  if (video) processVideoVariants({ videoId: video._id, id: randomUUID() });
 };
 
 app.disable('x-powered-by');
@@ -116,10 +144,23 @@ const isAdmin = req => (req.get('x-admin-password') || req.body?.password || req
 const requireAdmin = (req, res, next) => isAdmin(req) ? next() : res.status(401).json({ error: 'Admin authentication required' });
 app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false }));
 const uploadLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts. Try again in 15 minutes.' } });
-const upload = multer({ storage: multer.diskStorage({ destination: os.tmpdir(), filename: (_req, file, cb) => cb(null, `${randomUUID()}${extensionFor(file.originalname, file.mimetype, '.bin')}`) }), limits: { fileSize: 500 * 1024 * 1024, files: 2 }, fileFilter: (_req, file, cb) => { const valid = file.fieldname === 'video' ? file.mimetype.startsWith('video/') : file.mimetype.startsWith('image/'); cb(valid ? null : new Error('Only valid video and image files are allowed'), valid); } });
+const b2UploadStorage = {
+  _handleFile(_req, file, cb) {
+    const id = randomUUID();
+    const folder = file.fieldname === 'video' ? 'videos' : 'thumbnails';
+    const fallback = file.fieldname === 'video' ? '.mp4' : '.jpg';
+    const key = `${folder}/${id}${file.fieldname === 'video' ? '-original' : ''}${extensionFor(file.originalname, file.mimetype, fallback)}`;
+    let size = 0;
+    file.stream.on('data', chunk => { size += chunk.length; });
+    const operation = new Upload({ client: b2, params: { Bucket: B2_BUCKET, Key: key, Body: file.stream, ContentType: file.mimetype, CacheControl: 'private, max-age=3600' }, queueSize: 4, partSize: 10 * 1024 * 1024, leavePartsOnError: false });
+    operation.done().then(() => cb(null, { key, size })).catch(cb);
+  },
+  _removeFile(_req, file, cb) { deleteB2Objects([file.key]).then(() => cb()).catch(cb); },
+};
+const upload = multer({ storage: b2UploadStorage, limits: { fileSize: 500 * 1024 * 1024, files: 2 }, fileFilter: (_req, file, cb) => { const valid = file.fieldname === 'video' ? file.mimetype.startsWith('video/') : file.mimetype.startsWith('image/'); cb(valid ? null : new Error('Only valid video and image files are allowed'), valid); } });
 const uploadFields = upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]);
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, storage: 'b2', uploadMode: 'background-processing' }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, storage: 'b2', uploadMode: 'resumable-processing', activeProcessing: activeProcessing.size }));
 app.get('/api/videos', async (req, res, next) => { try {
   const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(48, Math.max(1, Number(req.query.limit) || 12));
   const filter = { status: 'published' };
@@ -128,6 +169,13 @@ app.get('/api/videos', async (req, res, next) => { try {
   const sort = req.query.sort === 'trending' ? { views: -1, uploadDate: -1 } : { uploadDate: -1 };
   const [items, total] = await Promise.all([Video.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).lean(), Video.countDocuments(filter)]);
   res.json({ items: await Promise.all(items.map(withSignedUrls)), page, pages: Math.ceil(total / limit), total });
+} catch (error) { next(error); } });
+app.get('/api/videos/:id/status', async (req, res, next) => { try {
+  if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' });
+  const video = await Video.findOne({ _id: req.params.id, status: 'published' }).select('videoKey thumbnailKey sources processingStatus').lean();
+  if (!video) return res.status(404).json({ error: 'Video not found' });
+  const signed = await withSignedUrls(video);
+  res.json({ processingStatus: video.processingStatus, sources: signed.sources });
 } catch (error) { next(error); } });
 app.get('/api/videos/:id', async (req, res, next) => { try {
   if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' });
@@ -144,22 +192,26 @@ app.get('/api/categories', async (_req, res, next) => { try {
 app.get('/api/admin/videos/:id', requireAdmin, async (req, res) => { try { const video = await Video.findById(req.params.id).lean(); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json({ video: await withSignedUrls(video) }); } catch (_error) { res.status(400).json({ error: 'Invalid video id' }); } });
 app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const [totalVideos, views, latest] = await Promise.all([Video.countDocuments(), Video.aggregate([{ $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find().sort({ uploadDate: -1 }).limit(12).lean()]); res.json({ totalVideos, totalViews: views[0]?.totalViews || 0, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
 
-app.post('/api/upload', uploadLimiter, uploadFields, requireAdmin, async (req, res, next) => {
+app.post('/api/upload', uploadLimiter, requireAdmin, uploadFields, async (req, res, next) => {
   let uploadedKeys = [];
-  let backgroundStarted = false;
   try {
     const videoFile = req.files?.video?.[0], thumbnailFile = req.files?.thumbnail?.[0];
-    if (!videoFile || !req.body.title?.trim() || !req.body.description?.trim() || !req.body.category?.trim()) return res.status(400).json({ error: 'Title, description, category and video are required' });
-    const id = randomUUID(), originalKey = `videos/${id}-original${extensionFor(videoFile.originalname, videoFile.mimetype, '.mp4')}`;
-    const thumbKey = `thumbnails/${id}${thumbnailFile ? extensionFor(thumbnailFile.originalname, thumbnailFile.mimetype, '.jpg') : '.svg'}`;
-    await putB2Object({ key: originalKey, body: fs.createReadStream(videoFile.path), contentType: videoFile.mimetype }); uploadedKeys.push(originalKey);
-    const thumbObject = await putB2Object({ key: thumbKey, body: thumbnailFile ? fs.createReadStream(thumbnailFile.path) : placeholderThumbnail(req.body.title), contentType: thumbnailFile?.mimetype || 'image/svg+xml' }); uploadedKeys.push(thumbKey);
-    const video = await Video.create({ title: clean(req.body.title, 140), description: clean(req.body.description), category: clean(req.body.category, 60), tags: String(req.body.tags || '').split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20), duration: Math.max(0, Number(req.body.duration) || 0), videoKey: originalKey, thumbnailKey: thumbObject.key, sources: [{ label: 'Original', key: originalKey }], processingStatus: 'queued', status: req.body.status === 'draft' ? 'draft' : 'published' });
+    uploadedKeys = [videoFile?.key, thumbnailFile?.key].filter(Boolean);
+    if (!videoFile || !req.body.title?.trim() || !req.body.description?.trim() || !req.body.category?.trim()) {
+      await deleteB2Objects(uploadedKeys).catch(() => {});
+      return res.status(400).json({ error: 'Title, description, category and video are required' });
+    }
+    const id = randomUUID(), originalKey = videoFile.key;
+    let thumbKey = thumbnailFile?.key;
+    if (!thumbKey) {
+      thumbKey = `thumbnails/${id}.svg`;
+      await putB2Object({ key: thumbKey, body: placeholderThumbnail(req.body.title), contentType: 'image/svg+xml' });
+      uploadedKeys.push(thumbKey);
+    }
+    const video = await Video.create({ title: clean(req.body.title, 140), description: clean(req.body.description), category: clean(req.body.category, 60), tags: String(req.body.tags || '').split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20), duration: Math.max(0, Number(req.body.duration) || 0), videoKey: originalKey, thumbnailKey: thumbKey, sources: [{ label: 'Original', key: originalKey }], processingStatus: 'queued', status: req.body.status === 'draft' ? 'draft' : 'published' });
     res.status(201).json(await withSignedUrls(video));
-    backgroundStarted = true;
-    processVideoVariants({ videoId: video._id, inputPath: videoFile.path, id });
+    processVideoVariants({ videoId: video._id, id });
   } catch (error) { await deleteB2Objects(uploadedKeys).catch(() => {}); next(error); }
-  finally { await Promise.all(Object.values(req.files || {}).flat().map(file => file.path).filter(file => !backgroundStarted || file !== req.files?.video?.[0]?.path).map(file => unlink(file).catch(() => {}))); }
 });
 app.put('/api/videos/:id', requireAdmin, async (req, res) => { try { const update = {}; ['title', 'description', 'category', 'status'].forEach(key => { if (req.body[key] != null) update[key] = clean(req.body[key], key === 'description' ? 2000 : 140); }); if (req.body.tags != null) update.tags = String(req.body.tags).split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20); const video = await Video.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true }); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json(video); } catch (error) { res.status(400).json({ error: error.message }); } });
 app.delete('/api/videos/:id', requireAdmin, async (req, res, next) => { try { const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([...new Set([video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)])]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
@@ -170,6 +222,12 @@ const appRoutes = ['/', '/latest', '/trending', '/categories', '/category/:slug'
 app.get(appRoutes, (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html'))); app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found' })); app.get('*', (_req, res) => res.redirect('/404'));
 app.use((error, _req, res, _next) => { console.error(error); const status = error instanceof multer.MulterError ? 400 : 500; res.status(status).json({ error: status === 400 ? error.message : 'Something went wrong' }); });
 let server;
-mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).then(() => { server = app.listen(PORT, () => console.log(`Server running at ${SITE_URL} with private Backblaze B2 storage`)); }).catch(error => { console.error('MongoDB connection failed:', error.message); process.exit(1); });
+mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).then(() => {
+  server = app.listen(PORT, () => {
+    console.log(`Server running at ${SITE_URL} with private Backblaze B2 storage`);
+    resumePendingProcessing().catch(error => console.error('Processing recovery failed:', error.message));
+  });
+  setInterval(() => resumePendingProcessing().catch(error => console.error('Processing recovery failed:', error.message)), 60000).unref();
+}).catch(error => { console.error('MongoDB connection failed:', error.message); process.exit(1); });
 const shutdown = signal => { console.log(`${signal} received; shutting down`); server?.close(async () => { await mongoose.connection.close(); process.exit(0); }); setTimeout(() => process.exit(1), 10000).unref(); };
 process.on('SIGTERM', () => shutdown('SIGTERM')); process.on('SIGINT', () => shutdown('SIGINT'));

@@ -8,7 +8,8 @@
     const video = document.querySelector('#videoPlayer');
     const shell = document.querySelector('#playerShell');
     if (!video || !shell) return;
-    const sources = videoData.sources?.length ? videoData.sources : [{ label: 'Original', url: videoData.videoUrl }];
+    let sources = videoData.sources?.length ? videoData.sources : [{ label: 'Original', url: videoData.videoUrl }];
+    clearInterval(window.playerProcessingTimer);
 
     video.controls = false;
     video.src = sources[0].url;
@@ -89,15 +90,36 @@
     volume.addEventListener('input', () => { video.volume = Number(volume.value); video.muted = false; mute.textContent = video.volume ? '🔊' : '🔇'; });
     mute.addEventListener('click', event => { event.stopPropagation(); video.muted = !video.muted; mute.textContent = video.muted ? '🔇' : '🔊'; });
     shell.querySelector('[data-control="speed"]').addEventListener('change', event => { video.playbackRate = Number(event.target.value); });
-    shell.querySelector('[data-control="quality"]').addEventListener('change', event => {
-      const next = sources[Number(event.target.value)];
-      if (!next || next.url === video.src) return;
+    const qualityControl = shell.querySelector('[data-control="quality"]');
+    const switchSource = next => {
+      if (!next || next.url === video.currentSrc) return;
       const currentTime = video.currentTime;
       const wasPlaying = !video.paused;
       video.src = next.url;
       video.load();
       video.addEventListener('loadedmetadata', () => { video.currentTime = Math.min(currentTime, video.duration || currentTime); if (wasPlaying) video.play(); }, { once: true });
+    };
+    qualityControl.addEventListener('change', event => {
+      const next = sources[Number(event.target.value)];
+      switchSource(next);
     });
+    if (videoData.processingStatus === 'queued' || videoData.processingStatus === 'processing') {
+      window.playerProcessingTimer = setInterval(async () => {
+        try {
+          const response = await fetch(`/api/videos/${videoData._id}/status`);
+          if (!response.ok) return;
+          const fresh = await response.json();
+          if (fresh.sources?.length > sources.length) {
+            sources = fresh.sources;
+            qualityControl.innerHTML = sources.map((source, index) => `<option value="${index}">${source.label}</option>`).join('');
+            qualityControl.value = '0';
+            switchSource(sources[0]);
+            window.showToast?.(`${sources[0].label} quality is ready`);
+          }
+          if (fresh.processingStatus === 'ready' || fresh.processingStatus === 'failed') clearInterval(window.playerProcessingTimer);
+        } catch (_) {}
+      }, 10000);
+    }
     shell.querySelector('[data-control="pip"]').addEventListener('click', async event => {
       event.stopPropagation();
       if (!document.pictureInPictureEnabled) return window.showToast?.('PiP is not supported on this device');
