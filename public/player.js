@@ -60,7 +60,10 @@
       return video.paused ? video.play() : video.pause();
     };
     const syncPlay = () => {
-      if (barPlayButton) barPlayButton.innerHTML = video.paused ? '&#9654;' : '&#10074;&#10074;';
+      if (barPlayButton) {
+        barPlayButton.innerHTML = video.paused ? '&#9654;' : '&#10074;&#10074;';
+        barPlayButton.setAttribute('aria-label', video.paused ? 'Play' : 'Pause');
+      }
       centerPlay.innerHTML = hasEnded ? '&#8635; <span>Replay</span>' : '&#9654;';
       centerPlay.setAttribute('aria-label', hasEnded ? 'Replay video' : 'Play video');
       centerPlay.classList.toggle('replay', hasEnded);
