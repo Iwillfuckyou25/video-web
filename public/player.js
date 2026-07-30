@@ -196,28 +196,6 @@
     video.load();
   };
 
-  async function makeThumbnail(file) {
-    const url = URL.createObjectURL(file);
-    const video = document.createElement('video');
-    video.muted = true;
-    video.preload = 'metadata';
-    video.src = url;
-    try {
-      await new Promise((resolve, reject) => { video.onloadedmetadata = resolve; video.onerror = reject; });
-      video.currentTime = Math.min(Math.max(0.5, video.duration * 0.1), Math.max(0.5, video.duration - 0.1));
-      await new Promise((resolve, reject) => { video.onseeked = resolve; video.onerror = reject; });
-      const canvas = document.createElement('canvas');
-      canvas.width = 960;
-      canvas.height = 540;
-      const context = canvas.getContext('2d');
-      const scale = Math.max(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
-      const width = video.videoWidth * scale;
-      const height = video.videoHeight * scale;
-      context.drawImage(video, (canvas.width - width) / 2, (canvas.height - height) / 2, width, height);
-      return await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.84));
-    } finally { URL.revokeObjectURL(url); }
-  }
-
   document.addEventListener('submit', async event => {
     if (event.target.id !== 'uploadForm') return;
     event.preventDefault();
@@ -226,28 +204,18 @@
     const button = form.querySelector('button');
     const bar = form.querySelector('.progress span');
     const videoFile = form.querySelector('[name="video"]').files[0];
-    const thumbInput = form.querySelector('[name="thumbnail"]');
     button.disabled = true;
-    button.textContent = thumbInput.files[0] ? 'Preparing upload…' : 'Creating thumbnail…';
+    button.textContent = 'Uploading…';
     const data = new FormData(form);
     try {
       if (!videoFile) throw new Error('Please select a video first.');
-      if (!thumbInput.files[0]) {
-        try {
-          const thumbnail = await makeThumbnail(videoFile);
-          if (thumbnail) data.set('thumbnail', thumbnail, 'auto-thumbnail.jpg');
-        } catch (_) {
-          window.showToast('Thumbnail could not be generated; uploading video with a placeholder.');
-        }
-      }
-      button.textContent = 'Uploading…';
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/api/upload');
       xhr.setRequestHeader('x-admin-password', sessionStorage.getItem('adminPassword') || '');
       xhr.upload.onprogress = progress => { if (progress.lengthComputable) bar.style.width = `${progress.loaded / progress.total * 100}%`; };
       xhr.onload = () => {
         button.disabled = false;
-        if (xhr.status === 201) { window.showToast?.('Video uploaded successfully'); history.pushState({}, '', '/admin'); window.dispatchEvent(new PopStateEvent('popstate')); }
+        if (xhr.status === 201) { window.showToast?.('Upload complete. Video will appear when fully ready.'); history.pushState({}, '', '/admin'); window.dispatchEvent(new PopStateEvent('popstate')); }
         else { button.textContent = 'Upload video'; let message=`Upload failed (${xhr.status})`;try{message=JSON.parse(xhr.responseText).error||message}catch(_){}window.showToast(message); }
       };
       xhr.onerror = () => { button.disabled = false; button.textContent = 'Upload video'; window.showToast?.('Network error'); };

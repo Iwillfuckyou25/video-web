@@ -22,7 +22,7 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.UPLOAD_PASSWORD;
 const SITE_URL = (process.env.SITE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const B2_BUCKET = process.env.B2_BUCKET;
-const PROCESSING_VERSION = 3;
+const PROCESSING_VERSION = 4;
 const SIGNED_URL_TTL = Math.min(86400, Math.max(300, Number(process.env.SIGNED_URL_TTL_SECONDS) || 14400));
 const B2_CACHE_CONTROL = `private, max-age=${SIGNED_URL_TTL}, immutable`;
 const required = ['UPLOAD_PASSWORD', 'MONGODB_URI', 'B2_ENDPOINT', 'B2_REGION', 'B2_KEY_ID', 'B2_APPLICATION_KEY', 'B2_BUCKET'];
@@ -70,6 +70,14 @@ const transcodeVideo = (input, output, height, maxRate, audioRate, crf) => new P
   process.on('error', reject);
   process.on('close', code => code === 0 ? resolve() : reject(new Error(`Video optimization failed (${code}): ${details}`)));
 });
+const createVideoThumbnail = (input, output) => new Promise((resolve, reject) => {
+  const args = ['-y', '-ss', '1', '-i', input, '-frames:v', '1', '-vf', 'scale=960:540:force_original_aspect_ratio=increase,crop=960:540', '-q:v', '3', output];
+  const process = spawn(ffmpegPath, args, { windowsHide: true });
+  let details = '';
+  process.stderr.on('data', chunk => { details = `${details}${chunk}`.slice(-4000); });
+  process.on('error', reject);
+  process.on('close', code => code === 0 ? resolve() : reject(new Error(`Thumbnail generation failed (${code}): ${details}`)));
+});
 
 const videoSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true, maxlength: 140 },
@@ -84,6 +92,8 @@ const videoSchema = new mongoose.Schema({
   processingError: { type: String, default: '' }, processingStartedAt: Date,
   processingAttempts: { type: Number, default: 0, min: 0 },
   processingVersion: { type: Number, default: 0, min: 0 },
+  autoThumbnailPending: { type: Boolean, default: false },
+  targetStatus: { type: String, enum: ['draft', 'published'], default: 'published' },
   status: { type: String, enum: ['draft', 'published'], default: 'published', index: true },
 }, { timestamps: true });
 videoSchema.index({ title: 'text', description: 'text', category: 'text', tags: 'text' });
@@ -94,8 +104,8 @@ const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id 
   if (activeProcessing.size || activeProcessing.has(lockId)) return;
   activeProcessing.add(lockId);
   let inputPath = suppliedInputPath;
-  const output480 = path.join(os.tmpdir(), `${id}-480p.mp4`), output720 = path.join(os.tmpdir(), `${id}-720p.mp4`);
-  const key480 = `videos/${id}-480p.mp4`, key720 = `videos/${id}-720p.mp4`;
+  const output480 = path.join(os.tmpdir(), `${id}-480p.mp4`), output720 = path.join(os.tmpdir(), `${id}-720p.mp4`), outputThumbnail = path.join(os.tmpdir(), `${id}-thumbnail.jpg`);
+  const key480 = `videos/${id}-480p.mp4`, key720 = `videos/${id}-720p.mp4`, autoThumbnailKey = `thumbnails/${id}-auto.jpg`;
   const createdKeys = [];
   try {
     const video = await Video.findById(videoId).lean();
@@ -106,39 +116,56 @@ const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id 
       await pipeline(object.Body, fs.createWriteStream(inputPath));
     }
     const processingAttempts = video.processingVersion === PROCESSING_VERSION ? (video.processingAttempts || 0) + 1 : 1;
-    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'processing', processingError: '', processingStartedAt: new Date(), processingAttempts, processingVersion: PROCESSING_VERSION } });
+    const targetStatus = video.targetStatus || video.status || 'published';
+    await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'processing', processingError: '', processingStartedAt: new Date(), processingAttempts, processingVersion: PROCESSING_VERSION, targetStatus, status: 'draft' } });
+    const needsAutoThumbnail = video.autoThumbnailPending || /\.svg$/i.test(video.thumbnailKey || '');
+    let finalThumbnailKey = video.thumbnailKey;
+    if (needsAutoThumbnail) {
+      await createVideoThumbnail(inputPath, outputThumbnail);
+      await putB2Object({ key: autoThumbnailKey, body: fs.createReadStream(outputThumbnail), contentType: 'image/jpeg' }); createdKeys.push(autoThumbnailKey);
+      finalThumbnailKey = autoThumbnailKey;
+      await Video.updateOne({ _id: videoId }, { $set: { thumbnailKey: autoThumbnailKey, autoThumbnailPending: false } });
+      await deleteB2Objects([video.thumbnailKey]).catch(() => {});
+    }
     const existing480 = (video.sources || []).find(source => source.label === '480p');
+    const existing720 = (video.sources || []).find(source => source.label === '720p');
     const final480Key = existing480?.key || key480;
     if (!existing480) {
       await transcodeVideo(inputPath, output480, 480, '900k', '64k', 29);
       await putB2Object({ key: key480, body: fs.createReadStream(output480), contentType: 'video/mp4' }); createdKeys.push(key480);
       await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: key480 }, { label: 'Original', key: video.videoKey }] } });
     }
-    await transcodeVideo(inputPath, output720, 720, '1800k', '96k', 27);
-    await putB2Object({ key: key720, body: fs.createReadStream(output720), contentType: 'video/mp4' }); createdKeys.push(key720);
-    await Video.updateOne({ _id: videoId }, { $set: { sources: [{ label: '480p', key: final480Key }, { label: '720p', key: key720 }, { label: 'Original', key: video.videoKey }], processingStatus: 'ready' } });
-    const staleVariantKeys = (video.sources || []).map(source => source.key).filter(key => key !== video.videoKey && key !== final480Key && !createdKeys.includes(key));
+    const final720Key = existing720?.key || key720;
+    if (!existing720) {
+      await transcodeVideo(inputPath, output720, 720, '1800k', '96k', 27);
+      await putB2Object({ key: key720, body: fs.createReadStream(output720), contentType: 'video/mp4' }); createdKeys.push(key720);
+    }
+    await Video.updateOne({ _id: videoId }, { $set: { thumbnailKey: finalThumbnailKey, sources: [{ label: '480p', key: final480Key }, { label: '720p', key: final720Key }, { label: 'Original', key: video.videoKey }], processingStatus: 'ready', status: targetStatus, autoThumbnailPending: false } });
+    const staleVariantKeys = (video.sources || []).map(source => source.key).filter(key => key !== video.videoKey && key !== final480Key && key !== final720Key && !createdKeys.includes(key));
     await deleteB2Objects(staleVariantKeys).catch(() => {});
   } catch (error) {
     console.error(`Background video processing failed for ${videoId}:`, error.message);
     await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'failed', processingError: clean(error.message, 500) } }).catch(() => {});
   } finally {
-    await Promise.all([inputPath, output480, output720].map(file => unlink(file).catch(() => {})));
+    await Promise.all([inputPath, output480, output720, outputThumbnail].map(file => unlink(file).catch(() => {})));
     activeProcessing.delete(lockId);
   }
 };
 const resumePendingProcessing = async () => {
   if (activeProcessing.size) return;
-  const missing720 = { $not: { $elemMatch: { label: '720p' } } };
-  let video = await Video.findOne({ sources: missing720, processingStatus: { $in: ['queued', 'processing'] } }).sort({ uploadDate: 1 }).lean();
+  const incompleteMedia = { $or: [{ sources: { $not: { $elemMatch: { label: '720p' } } } }, { autoThumbnailPending: true }, { thumbnailKey: /\.svg$/i }] };
+  let video = await Video.findOne({ ...incompleteMedia, processingStatus: { $in: ['queued', 'processing'] } }).sort({ uploadDate: 1 }).lean();
   if (!video) video = await Video.findOne({
-    sources: missing720,
-    $or: [
-      { processingStatus: { $exists: false } },
-      { processingStatus: 'failed', processingVersion: { $ne: PROCESSING_VERSION } },
-      { processingStatus: 'failed', processingVersion: PROCESSING_VERSION, processingAttempts: { $lt: 3 } },
+    $and: [
+      incompleteMedia,
+      { $or: [
+        { processingStatus: { $exists: false } },
+        { processingStatus: 'failed', processingVersion: { $ne: PROCESSING_VERSION } },
+        { processingStatus: 'failed', processingVersion: PROCESSING_VERSION, processingAttempts: { $lt: 3 } },
+      ] },
     ],
   }).sort({ uploadDate: 1 }).lean();
+  if (!video) video = await Video.findOne({ ...incompleteMedia, processingStatus: 'ready' }).sort({ uploadDate: 1 }).lean();
   if (video) processVideoVariants({ videoId: video._id, id: randomUUID() });
 };
 
@@ -174,7 +201,7 @@ const uploadFields = upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thu
 app.get('/api/health', (_req, res) => res.json({ ok: true, storage: 'b2', uploadMode: 'resumable-processing', activeProcessing: activeProcessing.size }));
 app.get('/api/videos', async (req, res, next) => { try {
   const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(48, Math.max(1, Number(req.query.limit) || 12));
-  const filter = { status: 'published' };
+  const filter = { status: 'published', processingStatus: 'ready' };
   if (req.query.category) filter.category = new RegExp(`^${escapeRegex(req.query.category)}$`, 'i');
   if (req.query.q) { const q = new RegExp(escapeRegex(req.query.q), 'i'); filter.$or = [{ title: q }, { description: q }, { category: q }, { tags: q }]; }
   const sort = req.query.sort === 'trending' ? { views: -1, uploadDate: -1 } : { uploadDate: -1 };
@@ -183,25 +210,25 @@ app.get('/api/videos', async (req, res, next) => { try {
 } catch (error) { next(error); } });
 app.get('/api/videos/:id/status', async (req, res, next) => { try {
   if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' });
-  const video = await Video.findOne({ _id: req.params.id, status: 'published' }).select('videoKey thumbnailKey sources processingStatus').lean();
+  const video = await Video.findOne({ _id: req.params.id, status: 'published', processingStatus: 'ready' }).select('videoKey thumbnailKey sources processingStatus').lean();
   if (!video) return res.status(404).json({ error: 'Video not found' });
   const signed = await withSignedUrls(video);
   res.json({ processingStatus: video.processingStatus, sources: signed.sources });
 } catch (error) { next(error); } });
 app.get('/api/videos/:id', async (req, res, next) => { try {
   if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' });
-  const video = await Video.findOneAndUpdate({ _id: req.params.id, status: 'published' }, { $inc: { views: 1 } }, { new: true }).lean();
+  const video = await Video.findOneAndUpdate({ _id: req.params.id, status: 'published', processingStatus: 'ready' }, { $inc: { views: 1 } }, { new: true }).lean();
   if (!video) return res.status(404).json({ error: 'Video not found' });
-  let related = await Video.find({ _id: { $ne: video._id }, status: 'published', $or: [{ category: video.category }, { tags: { $in: video.tags || [] } }] }).sort({ uploadDate: -1 }).limit(8).lean();
-  if (!related.length) related = await Video.find({ _id: { $ne: video._id }, status: 'published' }).sort({ uploadDate: -1 }).limit(8).lean();
+  let related = await Video.find({ _id: { $ne: video._id }, status: 'published', processingStatus: 'ready', $or: [{ category: video.category }, { tags: { $in: video.tags || [] } }] }).sort({ uploadDate: -1 }).limit(8).lean();
+  if (!related.length) related = await Video.find({ _id: { $ne: video._id }, status: 'published', processingStatus: 'ready' }).sort({ uploadDate: -1 }).limit(8).lean();
   res.json({ video: await withSignedUrls(video), related: await Promise.all(related.map(withSignedUrls)) });
 } catch (error) { next(error); } });
 app.get('/api/categories', async (_req, res, next) => { try {
-  const items = await Video.aggregate([{ $match: { status: 'published' } }, { $group: { _id: '$category', count: { $sum: 1 }, views: { $sum: '$views' }, thumbnailKey: { $first: '$thumbnailKey' } } }, { $sort: { count: -1 } }]);
+  const items = await Video.aggregate([{ $match: { status: 'published', processingStatus: 'ready' } }, { $group: { _id: '$category', count: { $sum: 1 }, views: { $sum: '$views' }, thumbnailKey: { $first: '$thumbnailKey' } } }, { $sort: { count: -1 } }]);
   res.json(await Promise.all(items.map(async x => ({ name: x._id, slug: String(x._id).toLowerCase().replace(/[^a-z0-9]+/g, '-'), count: x.count, views: x.views, thumbnailUrl: x.thumbnailKey ? await signedObjectUrl(x.thumbnailKey) : '' }))));
 } catch (error) { next(error); } });
 app.get('/api/admin/videos/:id', requireAdmin, async (req, res) => { try { const video = await Video.findById(req.params.id).lean(); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json({ video: await withSignedUrls(video) }); } catch (_error) { res.status(400).json({ error: 'Invalid video id' }); } });
-app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const [totalVideos, views, latest] = await Promise.all([Video.countDocuments(), Video.aggregate([{ $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find().sort({ uploadDate: -1 }).limit(12).lean()]); res.json({ totalVideos, totalViews: views[0]?.totalViews || 0, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
+app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const ready = { processingStatus: 'ready' }; const [totalVideos, views, latest] = await Promise.all([Video.countDocuments(ready), Video.aggregate([{ $match: ready }, { $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find(ready).sort({ uploadDate: -1 }).limit(12).lean()]); res.json({ totalVideos, totalViews: views[0]?.totalViews || 0, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
 
 app.post('/api/upload', uploadLimiter, requireAdmin, uploadFields, async (req, res, next) => {
   let uploadedKeys = [];
@@ -219,16 +246,17 @@ app.post('/api/upload', uploadLimiter, requireAdmin, uploadFields, async (req, r
       await putB2Object({ key: thumbKey, body: placeholderThumbnail(req.body.title), contentType: 'image/svg+xml' });
       uploadedKeys.push(thumbKey);
     }
-    const video = await Video.create({ title: clean(req.body.title, 140), description: clean(req.body.description), category: clean(req.body.category, 60), tags: String(req.body.tags || '').split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20), duration: Math.max(0, Number(req.body.duration) || 0), videoKey: originalKey, thumbnailKey: thumbKey, sources: [{ label: 'Original', key: originalKey }], processingStatus: 'queued', status: req.body.status === 'draft' ? 'draft' : 'published' });
+    const targetStatus = req.body.status === 'draft' ? 'draft' : 'published';
+    const video = await Video.create({ title: clean(req.body.title, 140), description: clean(req.body.description), category: clean(req.body.category, 60), tags: String(req.body.tags || '').split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20), duration: Math.max(0, Number(req.body.duration) || 0), videoKey: originalKey, thumbnailKey: thumbKey, sources: [{ label: 'Original', key: originalKey }], processingStatus: 'queued', autoThumbnailPending: !thumbnailFile, targetStatus, status: 'draft' });
     res.status(201).json(await withSignedUrls(video));
     processVideoVariants({ videoId: video._id, id });
   } catch (error) { await deleteB2Objects(uploadedKeys).catch(() => {}); next(error); }
 });
-app.put('/api/videos/:id', requireAdmin, async (req, res) => { try { const update = {}; ['title', 'description', 'category', 'status'].forEach(key => { if (req.body[key] != null) update[key] = clean(req.body[key], key === 'description' ? 2000 : 140); }); if (req.body.tags != null) update.tags = String(req.body.tags).split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20); const video = await Video.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true }); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json(video); } catch (error) { res.status(400).json({ error: error.message }); } });
+app.put('/api/videos/:id', requireAdmin, async (req, res) => { try { const current = await Video.findById(req.params.id); if (!current) return res.status(404).json({ error: 'Video not found' }); const update = {}; ['title', 'description', 'category'].forEach(key => { if (req.body[key] != null) update[key] = clean(req.body[key], key === 'description' ? 2000 : 140); }); if (req.body.status != null) { update.targetStatus = req.body.status === 'draft' ? 'draft' : 'published'; if (current.processingStatus === 'ready') update.status = update.targetStatus; } if (req.body.tags != null) update.tags = String(req.body.tags).split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20); const video = await Video.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true }); res.json(video); } catch (error) { res.status(400).json({ error: error.message }); } });
 app.delete('/api/videos/:id', requireAdmin, async (req, res, next) => { try { const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([...new Set([video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)])]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
 
 app.get('/robots.txt', (_req, res) => res.type('text').send(`User-agent: *\nAllow: /\nDisallow: /admin\nSitemap: ${SITE_URL}/sitemap.xml`));
-app.get('/sitemap.xml', async (_req, res) => { const videos = await Video.find({ status: 'published' }).select('_id').lean(); const urls = ['', '/latest', '/trending', '/categories', ...videos.map(v => `/watch/${v._id}`)]; res.type('xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/sitemap/0.9">${urls.map(url => `<url><loc>${SITE_URL}${url}</loc></url>`).join('')}</urlset>`); });
+app.get('/sitemap.xml', async (_req, res) => { const videos = await Video.find({ status: 'published', processingStatus: 'ready' }).select('_id').lean(); const urls = ['', '/latest', '/trending', '/categories', ...videos.map(v => `/watch/${v._id}`)]; res.type('xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/sitemap/0.9">${urls.map(url => `<url><loc>${SITE_URL}${url}</loc></url>`).join('')}</urlset>`); });
 const appRoutes = ['/', '/latest', '/trending', '/categories', '/category/:slug', '/watch/:videoId', '/search', '/admin', '/admin/upload', '/admin/video/:id', '/404'];
 app.get(appRoutes, (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html'))); app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found' })); app.get('*', (_req, res) => res.redirect('/404'));
 app.use((error, _req, res, _next) => { console.error(error); const status = error instanceof multer.MulterError ? 400 : 500; res.status(status).json({ error: status === 400 ? error.message : 'Something went wrong' }); });
