@@ -42,6 +42,7 @@
 
     document.querySelector('#speed')?.remove();
     const playButtons = shell.querySelectorAll('[data-control="play"]');
+    const barPlayButton = shell.querySelector('.pro-controls [data-control="play"]');
     const centerPlay = shell.querySelector('.center-play');
     const seek = shell.querySelector('[data-control="seek"]');
     const volume = shell.querySelector('[data-control="volume"]');
@@ -52,10 +53,17 @@
     let controlsTimer;
     let lastTap = 0;
     let seeking = false;
+    let hasEnded = false;
 
-    const togglePlay = () => video.paused ? video.play() : video.pause();
+    const togglePlay = () => {
+      if (hasEnded || video.ended) { video.currentTime = 0; hasEnded = false; return video.play(); }
+      return video.paused ? video.play() : video.pause();
+    };
     const syncPlay = () => {
-      playButtons.forEach(button => { button.innerHTML = video.paused ? '&#9654;' : '&#10074;&#10074;'; });
+      if (barPlayButton) barPlayButton.innerHTML = video.paused ? '&#9654;' : '&#10074;&#10074;';
+      centerPlay.innerHTML = hasEnded ? '&#8635; <span>Replay</span>' : '&#9654;';
+      centerPlay.setAttribute('aria-label', hasEnded ? 'Replay video' : 'Play video');
+      centerPlay.classList.toggle('replay', hasEnded);
       centerPlay.classList.toggle('show', video.paused);
     };
     const showControls = () => {
@@ -71,9 +79,10 @@
     };
 
     playButtons.forEach(button => button.addEventListener('click', event => { event.stopPropagation(); togglePlay(); }));
-    video.addEventListener('click', togglePlay);
-    video.addEventListener('play', syncPlay);
+    video.addEventListener('click', showControls);
+    video.addEventListener('play', () => { hasEnded = false; syncPlay(); });
     video.addEventListener('pause', () => { syncPlay(); showControls(); });
+    video.addEventListener('ended', () => { hasEnded = true; syncPlay(); showControls(); });
     video.addEventListener('waiting', () => shell.classList.remove('buffering'));
     video.addEventListener('stalled', () => shell.classList.remove('buffering'));
     video.addEventListener('playing', () => { shell.classList.remove('buffering'); syncPlay(); showControls(); });
