@@ -27,7 +27,10 @@
           <input class="pro-volume" data-control="volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume">
           <span class="pro-time">0:00 / 0:00</span>
           <span class="pro-spacer"></span>
-          <select data-control="quality" aria-label="Video quality">${sources.map((source, index) => `<option value="${index}">${source.label}</option>`).join('')}</select>
+          <div class="quality-control">
+            <button data-control="quality-menu" type="button" aria-label="Video quality" aria-expanded="false">&#9881; <span data-quality-label>${sources[0].label}</span></button>
+            <div class="quality-menu" role="menu">${sources.map((source, index) => `<button type="button" role="menuitemradio" aria-checked="${index === 0}" data-quality-index="${index}">${source.label}</button>`).join('')}</div>
+          </div>
           <select data-control="speed" aria-label="Playback speed">
             <option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="0.75">0.75x</option>
             <option value="1" selected>1x</option><option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2x</option>
@@ -90,7 +93,10 @@
     volume.addEventListener('input', () => { video.volume = Number(volume.value); video.muted = false; mute.textContent = video.volume ? '🔊' : '🔇'; });
     mute.addEventListener('click', event => { event.stopPropagation(); video.muted = !video.muted; mute.textContent = video.muted ? '🔇' : '🔊'; });
     shell.querySelector('[data-control="speed"]').addEventListener('change', event => { video.playbackRate = Number(event.target.value); });
-    const qualityControl = shell.querySelector('[data-control="quality"]');
+    const qualityButton = shell.querySelector('[data-control="quality-menu"]');
+    const qualityLabel = shell.querySelector('[data-quality-label]');
+    const qualityMenu = shell.querySelector('.quality-menu');
+    let selectedQuality = 0;
     const switchSource = next => {
       if (!next || next.url === video.currentSrc) return;
       const currentTime = video.currentTime;
@@ -99,9 +105,25 @@
       video.load();
       video.addEventListener('loadedmetadata', () => { video.currentTime = Math.min(currentTime, video.duration || currentTime); if (wasPlaying) video.play(); }, { once: true });
     };
-    qualityControl.addEventListener('change', event => {
-      const next = sources[Number(event.target.value)];
-      switchSource(next);
+    const renderQualityMenu = () => {
+      qualityMenu.innerHTML = sources.map((source, index) => `<button type="button" role="menuitemradio" aria-checked="${index === selectedQuality}" data-quality-index="${index}">${source.label}</button>`).join('');
+      qualityLabel.textContent = sources[selectedQuality]?.label || 'Quality';
+    };
+    qualityButton.addEventListener('click', event => {
+      event.stopPropagation();
+      const open = qualityMenu.classList.toggle('show');
+      qualityButton.setAttribute('aria-expanded', String(open));
+      showControls();
+    });
+    qualityMenu.addEventListener('click', event => {
+      const option = event.target.closest('[data-quality-index]');
+      if (!option) return;
+      event.stopPropagation();
+      selectedQuality = Number(option.dataset.qualityIndex);
+      renderQualityMenu();
+      qualityMenu.classList.remove('show');
+      qualityButton.setAttribute('aria-expanded', 'false');
+      switchSource(sources[selectedQuality]);
     });
     if (videoData.processingStatus === 'queued' || videoData.processingStatus === 'processing') {
       window.playerProcessingTimer = setInterval(async () => {
@@ -111,8 +133,8 @@
           const fresh = await response.json();
           if (fresh.sources?.length > sources.length) {
             sources = fresh.sources;
-            qualityControl.innerHTML = sources.map((source, index) => `<option value="${index}">${source.label}</option>`).join('');
-            qualityControl.value = '0';
+            selectedQuality = 0;
+            renderQualityMenu();
             switchSource(sources[0]);
             window.showToast?.(`${sources[0].label} quality is ready`);
           }
@@ -132,6 +154,7 @@
       else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
     });
     shell.addEventListener('pointermove', showControls);
+    shell.addEventListener('click', event => { if (!event.target.closest('.quality-control')) { qualityMenu.classList.remove('show'); qualityButton.setAttribute('aria-expanded', 'false'); } });
     shell.addEventListener('pointerleave', () => { if (!video.paused) shell.classList.remove('controls-visible'); });
     shell.addEventListener('pointerup', event => {
       if (event.target.closest('.pro-controls,.center-play')) return;

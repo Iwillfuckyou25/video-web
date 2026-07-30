@@ -24,6 +24,7 @@ const SITE_URL = (process.env.SITE_URL || `http://localhost:${PORT}`).replace(/\
 const B2_BUCKET = process.env.B2_BUCKET;
 const PROCESSING_VERSION = 3;
 const SIGNED_URL_TTL = Math.min(86400, Math.max(300, Number(process.env.SIGNED_URL_TTL_SECONDS) || 14400));
+const B2_CACHE_CONTROL = `private, max-age=${SIGNED_URL_TTL}, immutable`;
 const required = ['UPLOAD_PASSWORD', 'MONGODB_URI', 'B2_ENDPOINT', 'B2_REGION', 'B2_KEY_ID', 'B2_APPLICATION_KEY', 'B2_BUCKET'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) { console.error(`Missing required environment variables: ${missing.join(', ')}`); process.exit(1); }
@@ -41,7 +42,7 @@ const extensionFor = (name, mime, fallback) => {
   return subtype ? `.${subtype}` : fallback;
 };
 const putB2Object = async ({ key, body, contentType }) => {
-  const operation = new Upload({ client: b2, params: { Bucket: B2_BUCKET, Key: key, Body: body, ContentType: contentType, CacheControl: 'private, max-age=3600' }, queueSize: 4, partSize: 10 * 1024 * 1024, leavePartsOnError: false });
+  const operation = new Upload({ client: b2, params: { Bucket: B2_BUCKET, Key: key, Body: body, ContentType: contentType, CacheControl: B2_CACHE_CONTROL }, queueSize: 4, partSize: 10 * 1024 * 1024, leavePartsOnError: false });
   await operation.done();
   return { key };
 };
@@ -162,7 +163,7 @@ const b2UploadStorage = {
     const key = `${folder}/${id}${file.fieldname === 'video' ? '-original' : ''}${extensionFor(file.originalname, file.mimetype, fallback)}`;
     let size = 0;
     file.stream.on('data', chunk => { size += chunk.length; });
-    const operation = new Upload({ client: b2, params: { Bucket: B2_BUCKET, Key: key, Body: file.stream, ContentType: file.mimetype, CacheControl: 'private, max-age=3600' }, queueSize: 4, partSize: 10 * 1024 * 1024, leavePartsOnError: false });
+    const operation = new Upload({ client: b2, params: { Bucket: B2_BUCKET, Key: key, Body: file.stream, ContentType: file.mimetype, CacheControl: B2_CACHE_CONTROL }, queueSize: 4, partSize: 10 * 1024 * 1024, leavePartsOnError: false });
     operation.done().then(() => cb(null, { key, size })).catch(cb);
   },
   _removeFile(_req, file, cb) { deleteB2Objects([file.key]).then(() => cb()).catch(cb); },
