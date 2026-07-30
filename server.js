@@ -261,7 +261,8 @@ const appRoutes = ['/', '/latest', '/trending', '/categories', '/category/:slug'
 app.get(appRoutes, (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html'))); app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found' })); app.get('*', (_req, res) => res.redirect('/404'));
 app.use((error, _req, res, _next) => { console.error(error); const status = error instanceof multer.MulterError ? 400 : 500; res.status(status).json({ error: status === 400 ? error.message : 'Something went wrong' }); });
 let server;
-mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).then(() => {
+mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).then(async () => {
+  await Video.updateMany({ thumbnailKey: /\.svg$/i }, { $set: { autoThumbnailPending: true, processingStatus: 'queued' } });
   server = app.listen(PORT, () => {
     console.log(`Server running at ${SITE_URL} with private Backblaze B2 storage`);
     resumePendingProcessing().catch(error => console.error('Processing recovery failed:', error.message));
