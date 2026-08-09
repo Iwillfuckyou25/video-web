@@ -16,8 +16,8 @@ const grid = items => items.length ? `<div class="video-grid">${items.map(card).
 const skeleton = () => `<div class="video-grid">${Array(8).fill('<div><div class="thumb skeleton"></div><div class="card-body"><div class="skeleton" style="height:18px;border-radius:5px"></div></div></div>').join('')}</div>`;
 const section = (title, items, href='') => `<section class="section"><div class="section-head"><h2>${title}</h2>${href?`<a href="${href}" data-link>View all →</a>`:''}</div>${grid(items)}</section>`;
 
-function setMeta(title, description='Discover fresh and trending videos on Vistara.'){
-  document.title = `${title} — Vistara`; document.querySelector('meta[name="description"]').content=description;
+function setMeta(title, description='Discover fresh and trending videos on S3X Video.'){
+  document.title = `${title} — S3X Video`; document.querySelector('meta[name="description"]').content=description;
   document.querySelector('#canonical').href=location.href; document.querySelector('meta[property="og:title"]').content=document.title;
 }
 function activateNav(){ document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('active', a.getAttribute('href')===location.pathname)); }
