@@ -13,7 +13,7 @@ const os = require('os');
 const fs = require('fs');
 const { unlink } = require('fs/promises');
 const { pipeline } = require('stream/promises');
-const { randomUUID } = require('crypto');
+const { randomUUID, createHmac, createHash, timingSafeEqual } = require('crypto');
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
@@ -22,6 +22,9 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.UPLOAD_PASSWORD;
 const SITE_URL = (process.env.SITE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const B2_BUCKET = process.env.B2_BUCKET;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const SESSION_KEY = createHash('sha256').update(`${process.env.ADMIN_SESSION_SECRET || ''}:${ADMIN_PASSWORD || ''}:s3x-video-admin`).digest();
 const PROCESSING_VERSION = 4;
 const SIGNED_URL_TTL = Math.min(86400, Math.max(300, Number(process.env.SIGNED_URL_TTL_SECONDS) || 14400));
 const B2_CACHE_CONTROL = `private, max-age=${SIGNED_URL_TTL}, immutable`;
@@ -172,16 +175,25 @@ const resumePendingProcessing = async () => {
 app.disable('x-powered-by');
 app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
 mongoose.set('strictQuery', true);
-app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'", 'https://www.googletagmanager.com'], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], mediaSrc: ["'self'", 'https:'], connectSrc: ["'self'", 'https:', 'https://www.google-analytics.com', 'https://region1.google-analytics.com'], objectSrc: ["'none'"], baseUri: ["'self'"], frameAncestors: ["'none'"] } }, crossOriginResourcePolicy: { policy: 'cross-origin' }, referrerPolicy: { policy: 'strict-origin-when-cross-origin' } }));
+app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'", 'https://www.googletagmanager.com'], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], mediaSrc: ["'self'", 'https:'], connectSrc: ["'self'", 'https://www.google-analytics.com', 'https://region1.google-analytics.com'], objectSrc: ["'none'"], baseUri: ["'self'"], formAction: ["'self'"], frameAncestors: ["'none'"] } }, crossOriginResourcePolicy: { policy: 'cross-origin' }, referrerPolicy: { policy: 'strict-origin-when-cross-origin' }, strictTransportSecurity: IS_PRODUCTION ? { maxAge: 31536000, includeSubDomains: true, preload: true } : false }));
 app.use(compression());
-app.use(express.json({ limit: '1mb' })); app.use(express.urlencoded({ extended: false, limit: '1mb' }));
-app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1d', etag: true }));
+app.use(express.json({ limit: '128kb', strict: true })); app.use(express.urlencoded({ extended: false, limit: '128kb', parameterLimit: 30 }));
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1d', etag: true, dotfiles: 'deny', index: false }));
 const clean = (value, max = 2000) => String(value || '').replace(/[<>]/g, '').trim().slice(0, max);
 const escapeRegex = value => clean(value, 100).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const isAdmin = req => (req.get('x-admin-password') || req.body?.password || req.query?.password) === ADMIN_PASSWORD;
-const requireAdmin = (req, res, next) => isAdmin(req) ? next() : res.status(401).json({ error: 'Admin authentication required' });
-app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false }));
-const uploadLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Too many attempts. Try again in 15 minutes.' } });
+const safeEqual = (a, b) => { const left = Buffer.from(String(a || '')), right = Buffer.from(String(b || '')); return left.length === right.length && timingSafeEqual(left, right); };
+const parseCookies = req => Object.fromEntries(String(req.headers.cookie || '').split(';').map(item => item.trim().split(/=(.*)/s).slice(0, 2)).filter(([key]) => key).map(([key, value]) => [key, decodeURIComponent(value || '')]));
+const signSession = payload => { const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url'); return `${encoded}.${createHmac('sha256', SESSION_KEY).update(encoded).digest('base64url')}`; };
+const readSession = req => { try { const token = parseCookies(req).s3x_admin; if (!token) return null; const [encoded, signature] = token.split('.'); const expected = createHmac('sha256', SESSION_KEY).update(encoded).digest('base64url'); if (!safeEqual(signature, expected)) return null; const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString()); return payload.exp > Date.now() && typeof payload.csrf === 'string' ? payload : null; } catch { return null; } };
+const requireAdmin = (req, res, next) => { const session = readSession(req); if (!session) return res.status(401).json({ error: 'Admin authentication required' }); req.adminSession = session; next(); };
+const requireSameOrigin = (req, res, next) => { const expected = new URL(SITE_URL).origin; const origin = req.get('origin'); if (origin !== expected) return res.status(403).json({ error: 'Request origin rejected' }); next(); };
+const requireCsrf = (req, res, next) => safeEqual(req.get('x-csrf-token'), req.adminSession?.csrf) ? next() : res.status(403).json({ error: 'Security token expired. Please log in again.' });
+const rejectUnsafeKeys = (value, depth = 0) => { if (depth > 8 || value == null || typeof value !== 'object') return false; return Object.entries(value).some(([key, child]) => key.startsWith('$') || key.includes('.') || ['__proto__', 'prototype', 'constructor'].includes(key) || rejectUnsafeKeys(child, depth + 1)); };
+app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); if (rejectUnsafeKeys(req.body) || rejectUnsafeKeys(req.query) || rejectUnsafeKeys(req.params)) return res.status(400).json({ error: 'Invalid request data' }); next(); });
+app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 240, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many requests. Try again later.' } }));
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, skipSuccessfulRequests: true, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many login attempts. Try again in 15 minutes.' } });
+const adminWriteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many admin changes. Try again later.' } });
+const uploadLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 12, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Upload limit reached. Try again later.' } });
 const b2UploadStorage = {
   _handleFile(_req, file, cb) {
     const id = randomUUID();
@@ -195,10 +207,20 @@ const b2UploadStorage = {
   },
   _removeFile(_req, file, cb) { deleteB2Objects([file.key]).then(() => cb()).catch(cb); },
 };
-const upload = multer({ storage: b2UploadStorage, limits: { fileSize: 500 * 1024 * 1024, files: 2 }, fileFilter: (_req, file, cb) => { const valid = file.fieldname === 'video' ? file.mimetype.startsWith('video/') : file.mimetype.startsWith('image/'); cb(valid ? null : new Error('Only valid video and image files are allowed'), valid); } });
+const allowedVideoTypes = new Set(['video/mp4', 'video/webm', 'video/quicktime', 'video/x-matroska']);
+const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const upload = multer({ storage: b2UploadStorage, limits: { fileSize: 500 * 1024 * 1024, files: 2, fields: 8, parts: 10, fieldSize: 32 * 1024 }, fileFilter: (_req, file, cb) => { const valid = file.fieldname === 'video' ? allowedVideoTypes.has(file.mimetype) : file.fieldname === 'thumbnail' && allowedImageTypes.has(file.mimetype); cb(valid ? null : new Error('Unsupported file type. Use MP4, WebM, MOV, MKV, JPG, PNG or WebP.'), valid); } });
 const uploadFields = upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, storage: 'b2', uploadMode: 'resumable-processing', activeProcessing: activeProcessing.size }));
+app.post('/api/admin/login', loginLimiter, requireSameOrigin, (req, res) => {
+  if (!safeEqual(req.body?.password, ADMIN_PASSWORD)) return res.status(401).json({ error: 'Invalid admin password' });
+  const csrf = randomUUID();
+  res.cookie('s3x_admin', signSession({ exp: Date.now() + ADMIN_SESSION_TTL_MS, csrf }), { httpOnly: true, secure: IS_PRODUCTION, sameSite: 'strict', maxAge: ADMIN_SESSION_TTL_MS, path: '/' });
+  res.json({ ok: true, csrf });
+});
+app.post('/api/admin/logout', requireAdmin, requireSameOrigin, requireCsrf, (_req, res) => { res.clearCookie('s3x_admin', { httpOnly: true, secure: IS_PRODUCTION, sameSite: 'strict', path: '/' }); res.json({ ok: true }); });
+app.get('/api/admin/session', requireAdmin, (req, res) => res.json({ ok: true, csrf: req.adminSession.csrf }));
 app.get('/api/videos', async (req, res, next) => { try {
   const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(48, Math.max(1, Number(req.query.limit) || 12));
   const filter = { status: 'published', processingStatus: 'ready' };
@@ -230,7 +252,7 @@ app.get('/api/categories', async (_req, res, next) => { try {
 app.get('/api/admin/videos/:id', requireAdmin, async (req, res) => { try { const video = await Video.findById(req.params.id).lean(); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json({ video: await withSignedUrls(video) }); } catch (_error) { res.status(400).json({ error: 'Invalid video id' }); } });
 app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const ready = { processingStatus: 'ready' }; const [totalVideos, views, latest] = await Promise.all([Video.countDocuments(ready), Video.aggregate([{ $match: ready }, { $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find(ready).sort({ uploadDate: -1 }).limit(12).lean()]); res.json({ totalVideos, totalViews: views[0]?.totalViews || 0, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
 
-app.post('/api/upload', uploadLimiter, requireAdmin, uploadFields, async (req, res, next) => {
+app.post('/api/upload', uploadLimiter, requireAdmin, requireSameOrigin, requireCsrf, uploadFields, async (req, res, next) => {
   let uploadedKeys = [];
   try {
     const videoFile = req.files?.video?.[0], thumbnailFile = req.files?.thumbnail?.[0];
@@ -252,14 +274,14 @@ app.post('/api/upload', uploadLimiter, requireAdmin, uploadFields, async (req, r
     processVideoVariants({ videoId: video._id, id });
   } catch (error) { await deleteB2Objects(uploadedKeys).catch(() => {}); next(error); }
 });
-app.put('/api/videos/:id', requireAdmin, async (req, res) => { try { const current = await Video.findById(req.params.id); if (!current) return res.status(404).json({ error: 'Video not found' }); const update = {}; ['title', 'description', 'category'].forEach(key => { if (req.body[key] != null) update[key] = clean(req.body[key], key === 'description' ? 2000 : 140); }); if (req.body.status != null) { update.targetStatus = req.body.status === 'draft' ? 'draft' : 'published'; if (current.processingStatus === 'ready') update.status = update.targetStatus; } if (req.body.tags != null) update.tags = String(req.body.tags).split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20); const video = await Video.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true }); res.json(video); } catch (error) { res.status(400).json({ error: error.message }); } });
-app.delete('/api/videos/:id', requireAdmin, async (req, res, next) => { try { const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([...new Set([video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)])]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
+app.put('/api/videos/:id', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' }); const current = await Video.findById(req.params.id); if (!current) return res.status(404).json({ error: 'Video not found' }); const update = {}; ['title', 'description', 'category'].forEach(key => { if (req.body[key] != null) update[key] = clean(req.body[key], key === 'description' ? 2000 : key === 'category' ? 60 : 140); }); if (req.body.status != null) { update.targetStatus = req.body.status === 'draft' ? 'draft' : 'published'; if (current.processingStatus === 'ready') update.status = update.targetStatus; } if (req.body.tags != null) update.tags = String(req.body.tags).split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20); const video = await Video.findByIdAndUpdate(req.params.id, { $set: update }, { new: true, runValidators: true }); res.json(video); } catch (_error) { res.status(400).json({ error: 'Invalid video data' }); } });
+app.delete('/api/videos/:id', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (req, res, next) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' }); const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([...new Set([video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)])]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
 
 app.get('/robots.txt', (_req, res) => res.type('text').send(`User-agent: *\nAllow: /\nDisallow: /admin\nSitemap: ${SITE_URL}/sitemap.xml`));
 app.get('/sitemap.xml', async (_req, res) => { const videos = await Video.find({ status: 'published', processingStatus: 'ready' }).select('_id').lean(); const urls = ['', '/latest', '/trending', '/categories', ...videos.map(v => `/watch/${v._id}`)]; res.type('xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/sitemap/0.9">${urls.map(url => `<url><loc>${SITE_URL}${url}</loc></url>`).join('')}</urlset>`); });
 const appRoutes = ['/', '/latest', '/trending', '/categories', '/category/:slug', '/watch/:videoId', '/search', '/admin', '/admin/upload', '/admin/video/:id', '/404'];
 app.get(appRoutes, (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html'))); app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found' })); app.get('*', (_req, res) => res.redirect('/404'));
-app.use((error, _req, res, _next) => { console.error(error); const status = error instanceof multer.MulterError ? 400 : 500; res.status(status).json({ error: status === 400 ? error.message : 'Something went wrong' }); });
+app.use((error, _req, res, _next) => { console.error(error); const status = error instanceof multer.MulterError || error?.type === 'entity.too.large' || error instanceof SyntaxError ? 400 : 500; res.status(status).json({ error: status === 400 ? 'Invalid or oversized request' : 'Something went wrong' }); });
 let server;
 mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).then(async () => {
   await Video.updateMany({ thumbnailKey: /\.svg$/i }, { $set: { autoThumbnailPending: true, processingStatus: 'queued' } });

@@ -25,6 +25,8 @@ services:
         value: "14400"
       - key: UPLOAD_PASSWORD
         sync: false
+      - key: ADMIN_SESSION_SECRET
+        sync: false
       - key: MONGODB_URI
         sync: false
       - key: B2_KEY_ID
