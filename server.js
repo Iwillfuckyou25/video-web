@@ -101,6 +101,24 @@ const videoSchema = new mongoose.Schema({
 }, { timestamps: true });
 videoSchema.index({ title: 'text', description: 'text', category: 'text', tags: 'text' });
 const Video = mongoose.model('Video', videoSchema);
+const visitSchema = new mongoose.Schema({
+  visitorId: { type: String, required: true, maxlength: 80, index: true },
+  ip: { type: String, required: true, maxlength: 64, index: true },
+  page: { type: String, required: true, maxlength: 300 },
+  referrer: { type: String, default: '', maxlength: 500 },
+  userAgent: { type: String, default: '', maxlength: 500 },
+  browser: { type: String, default: 'Unknown', maxlength: 40 },
+  os: { type: String, default: 'Unknown', maxlength: 40 },
+  device: { type: String, default: 'Desktop', maxlength: 20 },
+  language: { type: String, default: '', maxlength: 20 },
+  screen: { type: String, default: '', maxlength: 20 },
+  visitedAt: { type: Date, default: Date.now, index: true },
+  expiresAt: { type: Date, required: true, index: { expires: 0 } },
+}, { versionKey: false });
+visitSchema.index({ visitorId: 1, visitedAt: -1 });
+const Visit = mongoose.model('Visit', visitSchema);
+const clientIp = req => String(req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/, '').slice(0, 64);
+const userAgentInfo = value => { const ua = String(value || ''); let browser = 'Other'; if (/Edg\//i.test(ua)) browser = 'Edge'; else if (/OPR\//i.test(ua)) browser = 'Opera'; else if (/Chrome\//i.test(ua)) browser = 'Chrome'; else if (/Firefox\//i.test(ua)) browser = 'Firefox'; else if (/Safari\//i.test(ua)) browser = 'Safari'; let os = 'Other'; if (/Windows/i.test(ua)) os = 'Windows'; else if (/Android/i.test(ua)) os = 'Android'; else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS'; else if (/Mac OS/i.test(ua)) os = 'macOS'; else if (/Linux/i.test(ua)) os = 'Linux'; const device = /iPad|Tablet/i.test(ua) ? 'Tablet' : /Mobile|Android|iPhone|iPod/i.test(ua) ? 'Mobile' : 'Desktop'; return { browser, os, device }; };
 const activeProcessing = new Set();
 const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id }) => {
   const lockId = String(videoId);
@@ -194,6 +212,7 @@ app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 240, standardHeader
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, skipSuccessfulRequests: true, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many login attempts. Try again in 15 minutes.' } });
 const adminWriteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many admin changes. Try again later.' } });
 const uploadLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 12, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Upload limit reached. Try again later.' } });
+const visitLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Visit limit reached.' } });
 const b2UploadStorage = {
   _handleFile(_req, file, cb) {
     const id = randomUUID();
@@ -221,6 +240,15 @@ app.post('/api/admin/login', loginLimiter, requireSameOrigin, (req, res) => {
 });
 app.post('/api/admin/logout', requireAdmin, requireSameOrigin, requireCsrf, (_req, res) => { res.clearCookie('s3x_admin', { httpOnly: true, secure: IS_PRODUCTION, sameSite: 'strict', path: '/' }); res.json({ ok: true }); });
 app.get('/api/admin/session', requireAdmin, (req, res) => res.json({ ok: true, csrf: req.adminSession.csrf }));
+app.post('/api/visits', visitLimiter, requireSameOrigin, async (req, res, next) => { try {
+  const page = clean(req.body?.page, 300);
+  if (!page.startsWith('/') || page.startsWith('/admin')) return res.status(204).end();
+  const visitorId = clean(req.body?.visitorId, 80).replace(/[^a-zA-Z0-9_-]/g, '');
+  if (visitorId.length < 10) return res.status(400).json({ error: 'Invalid visitor id' });
+  const agent = clean(req.get('user-agent'), 500), info = userAgentInfo(agent);
+  await Visit.create({ visitorId, ip: clientIp(req), page, referrer: clean(req.body?.referrer, 500), userAgent: agent, ...info, language: clean(req.body?.language, 20), screen: clean(req.body?.screen, 20), expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) });
+  res.status(204).end();
+} catch (error) { next(error); } });
 app.get('/api/videos', async (req, res, next) => { try {
   const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(48, Math.max(1, Number(req.query.limit) || 12));
   const filter = { status: 'published', processingStatus: 'ready' };
@@ -251,6 +279,16 @@ app.get('/api/categories', async (_req, res, next) => { try {
 } catch (error) { next(error); } });
 app.get('/api/admin/videos/:id', requireAdmin, async (req, res) => { try { const video = await Video.findById(req.params.id).lean(); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json({ video: await withSignedUrls(video) }); } catch (_error) { res.status(400).json({ error: 'Invalid video id' }); } });
 app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const ready = { processingStatus: 'ready' }; const [totalVideos, views, latest] = await Promise.all([Video.countDocuments(ready), Video.aggregate([{ $match: ready }, { $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find(ready).sort({ uploadDate: -1 }).limit(12).lean()]); res.json({ totalVideos, totalViews: views[0]?.totalViews || 0, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
+app.get('/api/admin/visits', requireAdmin, async (req, res, next) => { try {
+  const days = Math.min(30, Math.max(1, Number(req.query.days) || 7)), since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const match = { visitedAt: { $gte: since } };
+  const [totalVisits, uniqueIds, recent, daily, topPages] = await Promise.all([
+    Visit.countDocuments(match), Visit.distinct('visitorId', match), Visit.find(match).sort({ visitedAt: -1 }).limit(100).lean(),
+    Visit.aggregate([{ $match: match }, { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$visitedAt' } }, visits: { $sum: 1 }, visitors: { $addToSet: '$visitorId' } } }, { $project: { _id: 0, date: '$_id', visits: 1, uniqueVisitors: { $size: '$visitors' } } }, { $sort: { date: 1 } }]),
+    Visit.aggregate([{ $match: match }, { $group: { _id: '$page', visits: { $sum: 1 } } }, { $sort: { visits: -1 } }, { $limit: 8 }, { $project: { _id: 0, page: '$_id', visits: 1 } }]),
+  ]);
+  res.json({ days, totalVisits, uniqueVisitors: uniqueIds.length, recent, daily, topPages, retentionDays: 30 });
+} catch (error) { next(error); } });
 
 app.post('/api/upload', uploadLimiter, requireAdmin, requireSameOrigin, requireCsrf, uploadFields, async (req, res, next) => {
   let uploadedKeys = [];
