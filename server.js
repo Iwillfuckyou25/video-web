@@ -233,6 +233,7 @@ const upload = multer({ storage: b2UploadStorage, limits: { fileSize: 500 * 1024
 const uploadFields = upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]);
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, storage: 'b2', uploadMode: 'resumable-processing', activeProcessing: activeProcessing.size }));
+app.get('/api/site-info', (_req, res) => res.json({ legalContactEmail: clean(process.env.LEGAL_CONTACT_EMAIL, 254) }));
 app.post('/api/admin/login', loginLimiter, requireSameOrigin, (req, res) => {
   if (!safeEqual(req.body?.password, ADMIN_PASSWORD)) return res.status(401).json({ error: 'Invalid admin password' });
   const csrf = randomUUID();
@@ -317,8 +318,8 @@ app.put('/api/videos/:id', adminWriteLimiter, requireAdmin, requireSameOrigin, r
 app.delete('/api/videos/:id', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (req, res, next) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' }); const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([...new Set([video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)])]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
 
 app.get('/robots.txt', (_req, res) => res.type('text').send(`User-agent: *\nAllow: /\nDisallow: /admin\nSitemap: ${SITE_URL}/sitemap.xml`));
-app.get('/sitemap.xml', async (_req, res) => { const videos = await Video.find({ status: 'published', processingStatus: 'ready' }).select('_id').lean(); const urls = ['', '/latest', '/trending', '/categories', ...videos.map(v => `/watch/${v._id}`)]; res.type('xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/sitemap/0.9">${urls.map(url => `<url><loc>${SITE_URL}${url}</loc></url>`).join('')}</urlset>`); });
-const appRoutes = ['/', '/latest', '/trending', '/categories', '/category/:slug', '/watch/:videoId', '/search', '/admin', '/admin/upload', '/admin/video/:id', '/404'];
+app.get('/sitemap.xml', async (_req, res) => { const videos = await Video.find({ status: 'published', processingStatus: 'ready' }).select('_id').lean(); const urls = ['', '/latest', '/trending', '/categories', '/privacy', '/terms', '/copyright', '/18-plus', '/contact', ...videos.map(v => `/watch/${v._id}`)]; res.type('xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/sitemap/0.9">${urls.map(url => `<url><loc>${SITE_URL}${url}</loc></url>`).join('')}</urlset>`); });
+const appRoutes = ['/', '/latest', '/trending', '/categories', '/category/:slug', '/watch/:videoId', '/search', '/privacy', '/terms', '/copyright', '/18-plus', '/contact', '/admin', '/admin/upload', '/admin/video/:id', '/404'];
 app.get(appRoutes, (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html'))); app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found' })); app.get('*', (_req, res) => res.redirect('/404'));
 app.use((error, _req, res, _next) => { console.error(error); const status = error instanceof multer.MulterError || error?.type === 'entity.too.large' || error instanceof SyntaxError ? 400 : 500; res.status(status).json({ error: status === 400 ? 'Invalid or oversized request' : 'Something went wrong' }); });
 let server;

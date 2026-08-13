@@ -13,6 +13,8 @@ services:
         value: production
       - key: SITE_URL
         value: https://video-web-0xif.onrender.com
+      - key: LEGAL_CONTACT_EMAIL
+        sync: false
       - key: TRUST_PROXY
         value: "1"
       - key: B2_ENDPOINT
