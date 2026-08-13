@@ -170,6 +170,7 @@ const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id 
   } finally {
     await Promise.all([inputPath, output480, output720, outputThumbnail].map(file => unlink(file).catch(() => {})));
     activeProcessing.delete(lockId);
+    setTimeout(() => resumePendingProcessing().catch(error => console.error('Queued processing failed:', error.message)), 0).unref();
   }
 };
 const resumePendingProcessing = async () => {
@@ -278,7 +279,7 @@ app.get('/api/categories', async (_req, res, next) => { try {
   res.json(await Promise.all(items.map(async x => ({ name: x._id, slug: String(x._id).toLowerCase().replace(/[^a-z0-9]+/g, '-'), count: x.count, views: x.views, thumbnailUrl: x.thumbnailKey ? await signedObjectUrl(x.thumbnailKey) : '' }))));
 } catch (error) { next(error); } });
 app.get('/api/admin/videos/:id', requireAdmin, async (req, res) => { try { const video = await Video.findById(req.params.id).lean(); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json({ video: await withSignedUrls(video) }); } catch (_error) { res.status(400).json({ error: 'Invalid video id' }); } });
-app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const ready = { processingStatus: 'ready' }; const [totalVideos, views, latest] = await Promise.all([Video.countDocuments(ready), Video.aggregate([{ $match: ready }, { $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find(ready).sort({ uploadDate: -1 }).limit(12).lean()]); res.json({ totalVideos, totalViews: views[0]?.totalViews || 0, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
+app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const ready = { processingStatus: 'ready' }; const [totalVideos, readyVideos, views, latest] = await Promise.all([Video.countDocuments({}), Video.countDocuments(ready), Video.aggregate([{ $match: ready }, { $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find({}).sort({ uploadDate: -1 }).limit(20).lean()]); res.json({ totalVideos, readyVideos, totalViews: views[0]?.totalViews || 0, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
 app.get('/api/admin/visits', requireAdmin, async (req, res, next) => { try {
   const days = Math.min(30, Math.max(1, Number(req.query.days) || 7)), since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
   const match = { visitedAt: { $gte: since } };
