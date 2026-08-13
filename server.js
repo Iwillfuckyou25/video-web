@@ -23,7 +23,7 @@ const ADMIN_PASSWORD = process.env.UPLOAD_PASSWORD;
 const SITE_URL = (process.env.SITE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const B2_BUCKET = process.env.B2_BUCKET;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-const ADMIN_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const ADMIN_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 const SESSION_KEY = createHash('sha256').update(`${process.env.ADMIN_SESSION_SECRET || ''}:${ADMIN_PASSWORD || ''}:s3x-video-admin`).digest();
 const PROCESSING_VERSION = 4;
 const SIGNED_URL_TTL = Math.min(86400, Math.max(300, Number(process.env.SIGNED_URL_TTL_SECONDS) || 14400));
@@ -290,7 +290,7 @@ app.get('/api/admin/visits', requireAdmin, async (req, res, next) => { try {
   res.json({ days, totalVisits, uniqueVisitors: uniqueIds.length, recent, daily, topPages, retentionDays: 30 });
 } catch (error) { next(error); } });
 
-app.post('/api/upload', uploadLimiter, requireAdmin, requireSameOrigin, requireCsrf, uploadFields, async (req, res, next) => {
+app.post('/api/upload', uploadLimiter, requireAdmin, requireSameOrigin, uploadFields, async (req, res, next) => {
   let uploadedKeys = [];
   try {
     const videoFile = req.files?.video?.[0], thumbnailFile = req.files?.thumbnail?.[0];
