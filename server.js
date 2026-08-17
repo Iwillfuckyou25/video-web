@@ -84,7 +84,7 @@ const createVideoThumbnail = (input, output) => new Promise((resolve, reject) =>
 const probeVideoDuration = input => new Promise((resolve, reject) => {
   const process = spawn(ffmpegPath, ['-i', input], { windowsHide: true });
   let details = '';
-  process.stderr.on('data', chunk => { details = `${details}${chunk}`.slice(-12000); });
+  process.stderr.on('data', chunk => { if (details.length < 256000) details += chunk; });
   process.on('error', reject);
   process.on('close', () => {
     const match = details.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/i);
