@@ -1,0 +1,18 @@
+{
+  "name": "S3X Video",
+  "short_name": "S3X",
+  "description": "Discover newly added and trending adult videos on S3X Video.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ef4938",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
