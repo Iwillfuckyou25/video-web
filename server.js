@@ -317,10 +317,63 @@ app.post('/api/upload', uploadLimiter, requireAdmin, requireSameOrigin, uploadFi
 app.put('/api/videos/:id', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' }); const current = await Video.findById(req.params.id); if (!current) return res.status(404).json({ error: 'Video not found' }); const update = {}; ['title', 'description', 'category'].forEach(key => { if (req.body[key] != null) update[key] = clean(req.body[key], key === 'description' ? 2000 : key === 'category' ? 60 : 140); }); if (req.body.status != null) { update.targetStatus = req.body.status === 'draft' ? 'draft' : 'published'; if (current.processingStatus === 'ready') update.status = update.targetStatus; } if (req.body.tags != null) update.tags = String(req.body.tags).split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20); const video = await Video.findByIdAndUpdate(req.params.id, { $set: update }, { new: true, runValidators: true }); res.json(video); } catch (_error) { res.status(400).json({ error: 'Invalid video data' }); } });
 app.delete('/api/videos/:id', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (req, res, next) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' }); const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([...new Set([video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)])]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
 
-app.get('/robots.txt', (_req, res) => res.type('text').send(`User-agent: *\nAllow: /\nDisallow: /admin\nSitemap: ${SITE_URL}/sitemap.xml`));
-app.get('/sitemap.xml', async (_req, res) => { const videos = await Video.find({ status: 'published', processingStatus: 'ready' }).select('_id').lean(); const urls = ['', '/latest', '/trending', '/categories', '/privacy', '/terms', '/copyright', '/18-plus', '/contact', ...videos.map(v => `/watch/${v._id}`)]; res.type('xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/sitemap/0.9">${urls.map(url => `<url><loc>${SITE_URL}${url}</loc></url>`).join('')}</urlset>`); });
-const appRoutes = ['/', '/latest', '/trending', '/categories', '/category/:slug', '/watch/:videoId', '/search', '/privacy', '/terms', '/copyright', '/18-plus', '/contact', '/admin', '/admin/upload', '/admin/video/:id', '/404'];
-app.get(appRoutes, (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html'))); app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found' })); app.get('*', (_req, res) => res.redirect('/404'));
+const seoTemplate = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');
+const htmlEscape = value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+const xmlEscape = value => htmlEscape(value);
+const absoluteUrl = pathname => `${SITE_URL}${pathname.startsWith('/') ? pathname : `/${pathname}`}`;
+const seoPage = ({ title, description, canonical, type = 'website', image = '', body = '', robots = 'index,follow,max-image-preview:large,max-video-preview:-1', schema }) => {
+  const safeTitle = htmlEscape(title), safeDescription = htmlEscape(description), safeCanonical = htmlEscape(canonical), safeImage = htmlEscape(image);
+  let html = seoTemplate
+    .replace(/<title>[\s\S]*?<\/title>/i, `<title>${safeTitle}</title>`)
+    .replace(/<meta name="description"[^>]*>/i, `<meta name="description" content="${safeDescription}">`)
+    .replace(/<meta name="robots"[^>]*>/i, `<meta name="robots" content="${htmlEscape(robots)}">`)
+    .replace(/<meta property="og:type"[^>]*>/i, `<meta property="og:type" content="${htmlEscape(type)}">`)
+    .replace(/<meta property="og:title"[^>]*>/i, `<meta property="og:title" content="${safeTitle}">`)
+    .replace(/<meta property="og:description"[^>]*>/i, `<meta property="og:description" content="${safeDescription}">`)
+    .replace(/<meta property="og:url"[^>]*>/i, `<meta property="og:url" content="${safeCanonical}">`)
+    .replace(/<meta name="twitter:title"[^>]*>/i, `<meta name="twitter:title" content="${safeTitle}">`)
+    .replace(/<meta name="twitter:description"[^>]*>/i, `<meta name="twitter:description" content="${safeDescription}">`)
+    .replace(/<link rel="canonical"[^>]*>/i, `<link rel="canonical" id="canonical" href="${safeCanonical}">`);
+  if (image) html = html.replace('</head>', `<meta property="og:image" content="${safeImage}"><meta name="twitter:image" content="${safeImage}"></head>`);
+  if (schema) html = html.replace('</head>', `<script id="serverSeoSchema" type="application/ld+json">${JSON.stringify(schema).replace(/</g, '\\u003c')}</script></head>`);
+  if (body) html = html.replace(/<main id="app" tabindex="-1">[\s\S]*?<\/main>/i, `<main id="app" tabindex="-1">${body}</main>`);
+  return html;
+};
+const staticSeo = {
+  '/': ['S3X Video — Latest and trending videos', 'Watch the latest, trending and recently added adult videos. Browse categories and discover new videos on S3X Video.'],
+  '/latest': ['Latest videos — S3X Video', 'Browse the newest adult videos recently added to S3X Video.'],
+  '/trending': ['Trending videos — S3X Video', 'Discover the adult videos currently trending on S3X Video.'],
+  '/categories': ['Video categories — S3X Video', 'Browse S3X Video by category and find videos that match your interests.'],
+  '/privacy': ['Privacy Policy — S3X Video', 'Read how S3X Video handles visitor information, analytics, storage and privacy requests.'],
+  '/terms': ['Terms of Service — S3X Video', 'Read the terms and acceptable-use rules for accessing S3X Video.'],
+  '/copyright': ['Copyright and takedown policy — S3X Video', 'Learn how to submit copyright reports and takedown requests to S3X Video.'],
+  '/18-plus': ['18+ Disclaimer — S3X Video', 'S3X Video is intended only for adults who meet the legal age requirement in their location.'],
+  '/contact': ['Contact and grievance — S3X Video', 'Contact S3X Video about privacy, safety, copyright or access concerns.'],
+};
+
+app.get('/media/:id/thumbnail', async (req, res, next) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.sendStatus(404); const video = await Video.findOne({ _id: req.params.id, status: 'published', processingStatus: 'ready' }).select('thumbnailKey').lean(); if (!video) return res.sendStatus(404); res.set('Cache-Control', 'public, max-age=3600').redirect(302, await signedObjectUrl(video.thumbnailKey)); } catch (error) { next(error); } });
+app.get('/media/:id/video', async (req, res, next) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.sendStatus(404); const video = await Video.findOne({ _id: req.params.id, status: 'published', processingStatus: 'ready' }).select('videoKey sources').lean(); if (!video) return res.sendStatus(404); const key = video.sources?.find(source => source.label === '480p')?.key || video.videoKey; res.set('Cache-Control', 'public, max-age=900').redirect(302, await signedObjectUrl(key)); } catch (error) { next(error); } });
+
+app.get('/watch/:videoId', async (req, res, next) => { try {
+  if (!mongoose.isObjectIdOrHexString(req.params.videoId)) return res.status(404).send(seoPage({ title: 'Video not found — S3X Video', description: 'The requested video could not be found.', canonical: absoluteUrl('/404'), robots: 'noindex,follow' }));
+  const video = await Video.findOne({ _id: req.params.videoId, status: 'published', processingStatus: 'ready' }).lean();
+  if (!video) return res.status(404).send(seoPage({ title: 'Video not found — S3X Video', description: 'The requested video could not be found.', canonical: absoluteUrl('/404'), robots: 'noindex,follow' }));
+  const canonical = absoluteUrl(`/watch/${video._id}`), thumbnail = absoluteUrl(`/media/${video._id}/thumbnail`), contentUrl = absoluteUrl(`/media/${video._id}/video`);
+  const description = clean(video.description, 155) || `Watch ${video.title} on S3X Video.`;
+  const schema = { '@context': 'https://schema.org', '@type': 'VideoObject', name: video.title, description, thumbnailUrl: [thumbnail], uploadDate: new Date(video.uploadDate || video.createdAt).toISOString(), contentUrl, embedUrl: canonical, isFamilyFriendly: false };
+  if (video.duration > 0) schema.duration = `PT${Math.round(video.duration)}S`;
+  const body = `<article class="seo-video-summary"><h1>${htmlEscape(video.title)}</h1><p>${htmlEscape(description)}</p><p>${htmlEscape(video.category)} · ${new Date(video.uploadDate || video.createdAt).toLocaleDateString('en-US')}</p><noscript><p>JavaScript is required to play this video.</p></noscript></article>`;
+  res.type('html').send(seoPage({ title: `${video.title} — S3X Video`, description, canonical, type: 'video.other', image: thumbnail, body, schema }));
+} catch (error) { next(error); } });
+
+app.get('/robots.txt', (_req, res) => res.type('text').send(`User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /api/\nSitemap: ${SITE_URL}/sitemap.xml\nSitemap: ${SITE_URL}/video-sitemap.xml`));
+app.get('/sitemap.xml', async (_req, res, next) => { try { const videos = await Video.find({ status: 'published', processingStatus: 'ready' }).select('_id updatedAt').lean(); const fixed = Object.keys(staticSeo); const urls = [...fixed.map(url => ({ url, lastmod: new Date().toISOString() })), ...videos.map(video => ({ url: `/watch/${video._id}`, lastmod: new Date(video.updatedAt || Date.now()).toISOString() }))]; res.type('xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/sitemap/0.9">${urls.map(item => `<url><loc>${xmlEscape(absoluteUrl(item.url))}</loc><lastmod>${item.lastmod}</lastmod></url>`).join('')}</urlset>`); } catch (error) { next(error); } });
+app.get('/video-sitemap.xml', async (_req, res, next) => { try { const videos = await Video.find({ status: 'published', processingStatus: 'ready' }).sort({ uploadDate: -1 }).limit(1000).lean(); res.type('xml').send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/sitemap/0.9" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">${videos.map(video => `<url><loc>${xmlEscape(absoluteUrl(`/watch/${video._id}`))}</loc><video:video><video:thumbnail_loc>${xmlEscape(absoluteUrl(`/media/${video._id}/thumbnail`))}</video:thumbnail_loc><video:title>${xmlEscape(video.title)}</video:title><video:description>${xmlEscape(clean(video.description, 1800) || video.title)}</video:description><video:content_loc>${xmlEscape(absoluteUrl(`/media/${video._id}/video`))}</video:content_loc><video:publication_date>${new Date(video.uploadDate || video.createdAt).toISOString()}</video:publication_date><video:family_friendly>no</video:family_friendly></video:video></url>`).join('')}</urlset>`); } catch (error) { next(error); } });
+app.get('/category/:slug', (req, res) => { const label = clean(req.params.slug, 60).replace(/-/g, ' ').replace(/\b\w/g, character => character.toUpperCase()); res.type('html').send(seoPage({ title: `${label} videos — S3X Video`, description: `Browse ${label} adult videos on S3X Video.`, canonical: absoluteUrl(`/category/${encodeURIComponent(req.params.slug)}`), body: `<section class="seo-video-summary"><h1>${htmlEscape(label)} videos</h1><p>Browse videos in the ${htmlEscape(label)} category.</p></section>` })); });
+app.get('/search', (req, res) => { const query = clean(req.query.q, 80); res.type('html').send(seoPage({ title: query ? `Search results for ${query} — S3X Video` : 'Search — S3X Video', description: 'Search videos, categories and tags on S3X Video.', canonical: absoluteUrl('/search'), robots: 'noindex,follow' })); });
+app.get(['/admin', '/admin/upload', '/admin/video/:id', '/404'], (req, res) => res.type('html').send(seoPage({ title: req.path.startsWith('/admin') ? 'Admin — S3X Video' : 'Page not found — S3X Video', description: 'S3X Video', canonical: absoluteUrl(req.path), robots: 'noindex,nofollow' })));
+app.get(Object.keys(staticSeo), (req, res) => { const [title, description] = staticSeo[req.path]; const schema = req.path === '/' ? { '@context': 'https://schema.org', '@type': 'WebSite', name: 'S3X Video', url: SITE_URL, potentialAction: { '@type': 'SearchAction', target: `${SITE_URL}/search?q={search_term_string}`, 'query-input': 'required name=search_term_string' } } : undefined; const body = req.path === '/' ? '<section class="seo-video-summary"><h1>Latest and trending videos</h1><p>Browse recently added videos, trending videos and categories on S3X Video.</p></section>' : ''; res.type('html').send(seoPage({ title, description, canonical: absoluteUrl(req.path), body, schema })); });
+app.use('/api', (_req, res) => res.status(404).json({ error: 'API route not found' })); app.get('*', (_req, res) => res.redirect('/404'));
 app.use((error, _req, res, _next) => { console.error(error); const status = error instanceof multer.MulterError || error?.type === 'entity.too.large' || error instanceof SyntaxError ? 400 : 500; res.status(status).json({ error: status === 400 ? 'Invalid or oversized request' : 'Something went wrong' }); });
 let server;
 mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).then(async () => {

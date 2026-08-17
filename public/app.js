@@ -20,7 +20,7 @@ const section = (title, items, href='') => `<section class="section"><div class=
 
 function setMeta(title, description='Discover fresh and trending videos on S3X Video.'){
   document.title = `${title} — S3X Video`; document.querySelector('meta[name="description"]').content=description;
-  document.querySelector('#canonical').href=location.href; document.querySelector('meta[property="og:title"]').content=document.title;
+  const canonical=new URL(location.pathname+location.search,location.origin).href;document.querySelector('#canonical').href=canonical;document.querySelector('meta[property="og:title"]').content=document.title;document.querySelector('meta[property="og:description"]').content=description;document.querySelector('meta[property="og:url"]').content=canonical;document.querySelector('meta[name="twitter:title"]').content=document.title;document.querySelector('meta[name="twitter:description"]').content=description;document.querySelector('#serverSeoSchema')?.remove();document.querySelector('#videoSchema')?.remove();
 }
 function activateNav(){ document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('active', a.getAttribute('href')===location.pathname)); }
 function pagination(data){ if(data.pages<=1)return''; return `<div class="pagination"><button data-page="${data.page-1}" ${data.page<=1?'disabled':''}>← Previous</button><button disabled>${data.page} / ${data.pages}</button><button data-page="${data.page+1}" ${data.page>=data.pages?'disabled':''}>Next →</button></div>`; }
