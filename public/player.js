@@ -12,8 +12,8 @@
     clearInterval(window.playerProcessingTimer);
 
     video.controls = false;
-    video.src = sources[0].url;
     video.preload = 'auto';
+    video.src = sources[0].url;
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
     shell.querySelector('.player-spinner')?.setAttribute('aria-hidden', 'true');
@@ -90,11 +90,13 @@
     video.addEventListener('stalled', () => shell.classList.remove('buffering'));
     video.addEventListener('playing', () => { shell.classList.remove('buffering'); syncPlay(); showControls(); });
     video.addEventListener('canplay', () => shell.classList.remove('buffering'));
+    const syncDuration = () => { clock.textContent = `${timeText(video.currentTime)} / ${timeText(video.duration || videoData.duration)}`; };
     video.addEventListener('loadedmetadata', () => {
-      clock.textContent = `0:00 / ${timeText(video.duration)}`;
+      syncDuration();
       const saved = Number(localStorage.getItem(`resume:${videoData._id}`));
       if (saved > 5 && saved < video.duration - 10) video.currentTime = saved;
     });
+    video.addEventListener('durationchange', syncDuration);
     video.addEventListener('timeupdate', () => {
       if (!seeking && video.duration) seek.value = Math.round(video.currentTime / video.duration * 1000);
       clock.textContent = `${timeText(video.currentTime)} / ${timeText(video.duration)}`;
@@ -192,8 +194,8 @@
       if (actions[key]) { event.preventDefault(); actions[key](); showControls(); }
     };
     syncPlay();
+    syncDuration();
     showControls();
-    video.load();
   };
 
   document.addEventListener('submit', async event => {

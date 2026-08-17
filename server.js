@@ -81,6 +81,17 @@ const createVideoThumbnail = (input, output) => new Promise((resolve, reject) =>
   process.on('error', reject);
   process.on('close', code => code === 0 ? resolve() : reject(new Error(`Thumbnail generation failed (${code}): ${details}`)));
 });
+const probeVideoDuration = input => new Promise((resolve, reject) => {
+  const process = spawn(ffmpegPath, ['-i', input], { windowsHide: true });
+  let details = '';
+  process.stderr.on('data', chunk => { details = `${details}${chunk}`.slice(-12000); });
+  process.on('error', reject);
+  process.on('close', () => {
+    const match = details.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)/i);
+    if (!match) return reject(new Error('Video duration could not be detected'));
+    resolve(Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]));
+  });
+});
 
 const videoSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true, maxlength: 140 },
@@ -136,6 +147,7 @@ const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id 
       const object = await b2.send(new GetObjectCommand({ Bucket: B2_BUCKET, Key: video.videoKey }));
       await pipeline(object.Body, fs.createWriteStream(inputPath));
     }
+    const detectedDuration = await probeVideoDuration(inputPath).catch(() => Number(video.duration) || 0);
     const processingAttempts = video.processingVersion === PROCESSING_VERSION ? (video.processingAttempts || 0) + 1 : 1;
     const targetStatus = video.targetStatus || video.status || 'published';
     await Video.updateOne({ _id: videoId }, { $set: { processingStatus: 'processing', processingError: '', processingStartedAt: new Date(), processingAttempts, processingVersion: PROCESSING_VERSION, targetStatus, status: 'draft' } });
@@ -161,7 +173,7 @@ const processVideoVariants = async ({ videoId, inputPath: suppliedInputPath, id 
       await transcodeVideo(inputPath, output720, 720, '1800k', '96k', 27);
       await putB2Object({ key: key720, body: fs.createReadStream(output720), contentType: 'video/mp4' }); createdKeys.push(key720);
     }
-    await Video.updateOne({ _id: videoId }, { $set: { thumbnailKey: finalThumbnailKey, sources: [{ label: '480p', key: final480Key }, { label: '720p', key: final720Key }, { label: 'Original', key: video.videoKey }], processingStatus: 'ready', status: targetStatus, autoThumbnailPending: false } });
+    await Video.updateOne({ _id: videoId }, { $set: { thumbnailKey: finalThumbnailKey, sources: [{ label: '480p', key: final480Key }, { label: '720p', key: final720Key }, { label: 'Original', key: video.videoKey }], duration: detectedDuration, processingStatus: 'ready', status: targetStatus, autoThumbnailPending: false } });
     const staleVariantKeys = (video.sources || []).map(source => source.key).filter(key => key !== video.videoKey && key !== final480Key && key !== final720Key && !createdKeys.includes(key));
     await deleteB2Objects(staleVariantKeys).catch(() => {});
   } catch (error) {
@@ -189,6 +201,26 @@ const resumePendingProcessing = async () => {
   }).sort({ uploadDate: 1 }).lean();
   if (!video) video = await Video.findOne({ ...incompleteMedia, processingStatus: 'ready' }).sort({ uploadDate: 1 }).lean();
   if (video) processVideoVariants({ videoId: video._id, id: randomUUID() });
+};
+let durationBackfillActive = false;
+const backfillMissingDuration = async () => {
+  if (durationBackfillActive || activeProcessing.size) return;
+  const video = await Video.findOne({ processingStatus: 'ready', duration: { $lte: 0 } }).sort({ uploadDate: 1 }).lean();
+  if (!video) return;
+  durationBackfillActive = true;
+  const source = (video.sources || []).find(item => item.label === '480p') || (video.sources || [])[0] || { key: video.videoKey };
+  const inputPath = path.join(os.tmpdir(), `${video._id}-duration${path.extname(source.key) || '.mp4'}`);
+  try {
+    const object = await b2.send(new GetObjectCommand({ Bucket: B2_BUCKET, Key: source.key }));
+    await pipeline(object.Body, fs.createWriteStream(inputPath));
+    const duration = await probeVideoDuration(inputPath);
+    if (duration > 0) await Video.updateOne({ _id: video._id }, { $set: { duration } });
+  } catch (error) {
+    console.error(`Duration backfill failed for ${video._id}:`, error.message);
+  } finally {
+    await unlink(inputPath).catch(() => {});
+    durationBackfillActive = false;
+  }
 };
 
 app.disable('x-powered-by');
@@ -387,8 +419,10 @@ mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).t
   server = app.listen(PORT, () => {
     console.log(`Server running at ${SITE_URL} with private Backblaze B2 storage`);
     resumePendingProcessing().catch(error => console.error('Processing recovery failed:', error.message));
+    backfillMissingDuration().catch(error => console.error('Duration recovery failed:', error.message));
   });
   setInterval(() => resumePendingProcessing().catch(error => console.error('Processing recovery failed:', error.message)), 60000).unref();
+  setInterval(() => backfillMissingDuration().catch(error => console.error('Duration recovery failed:', error.message)), 60000).unref();
 }).catch(error => { console.error('MongoDB connection failed:', error.message); process.exit(1); });
 const shutdown = signal => { console.log(`${signal} received; shutting down`); server?.close(async () => { await mongoose.connection.close(); process.exit(0); }); setTimeout(() => process.exit(1), 10000).unref(); };
 process.on('SIGTERM', () => shutdown('SIGTERM')); process.on('SIGINT', () => shutdown('SIGINT'));
