@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const multer = require('multer');
-const { S3Client, DeleteObjectsCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const helmet = require('helmet');
@@ -61,8 +61,38 @@ const withSignedUrls = async video => {
   return { ...value, videoUrl: sources[0].url, thumbnailUrl, sources };
 };
 const deleteB2Objects = async keys => {
-  const Objects = keys.filter(Boolean).map(Key => ({ Key }));
-  if (Objects.length) await b2.send(new DeleteObjectsCommand({ Bucket: B2_BUCKET, Delete: { Objects, Quiet: true } }));
+  const uniqueKeys = [...new Set(keys.filter(Boolean))];
+  for (let index = 0; index < uniqueKeys.length; index += 1000) {
+    const Objects = uniqueKeys.slice(index, index + 1000).map(Key => ({ Key }));
+    if (Objects.length) await b2.send(new DeleteObjectsCommand({ Bucket: B2_BUCKET, Delete: { Objects, Quiet: true } }));
+  }
+};
+let storageCleanupActive = false;
+const cleanupOrphanedStorage = async () => {
+  if (storageCleanupActive || activeProcessing.size) return { skipped: true, deleted: 0, bytes: 0 };
+  storageCleanupActive = true;
+  try {
+    const videos = await Video.find({}).select('videoKey thumbnailKey sources.key').lean();
+    const referenced = new Set(videos.flatMap(video => [video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)]).filter(Boolean));
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const orphaned = [];
+    for (const Prefix of ['videos/', 'thumbnails/']) {
+      let ContinuationToken;
+      do {
+        const page = await b2.send(new ListObjectsV2Command({ Bucket: B2_BUCKET, Prefix, ContinuationToken, MaxKeys: 1000 }));
+        for (const object of page.Contents || []) {
+          if (object.Key && !referenced.has(object.Key) && new Date(object.LastModified || 0).getTime() < cutoff) orphaned.push(object);
+        }
+        ContinuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+      } while (ContinuationToken);
+    }
+    await deleteB2Objects(orphaned.map(object => object.Key));
+    const bytes = orphaned.reduce((total, object) => total + Number(object.Size || 0), 0);
+    if (orphaned.length) console.log(`Storage cleanup removed ${orphaned.length} orphaned B2 objects (${bytes} bytes)`);
+    return { skipped: false, deleted: orphaned.length, bytes };
+  } finally {
+    storageCleanupActive = false;
+  }
 };
 const placeholderThumbnail = title => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540"><rect width="960" height="540" fill="#111318"/><circle cx="480" cy="240" r="58" fill="#ff4d36"/><path d="M462 205v70l58-35z" fill="white"/><text x="480" y="360" fill="white" font-family="Arial,sans-serif" font-size="30" text-anchor="middle">${String(title).replace(/[&<>"']/g, '')}</text></svg>`);
 const transcodeVideo = (input, output, height, maxRate, audioRate, crf) => new Promise((resolve, reject) => {
@@ -314,6 +344,7 @@ app.get('/api/categories', async (_req, res, next) => { try {
 } catch (error) { next(error); } });
 app.get('/api/admin/videos/:id', requireAdmin, async (req, res) => { try { const video = await Video.findById(req.params.id).lean(); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json({ video: await withSignedUrls(video) }); } catch (_error) { res.status(400).json({ error: 'Invalid video id' }); } });
 app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const ready = { processingStatus: 'ready' }; const [totalVideos, readyVideos, views, latest] = await Promise.all([Video.countDocuments({}), Video.countDocuments(ready), Video.aggregate([{ $match: ready }, { $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find({}).sort({ uploadDate: -1 }).limit(20).lean()]); res.json({ totalVideos, readyVideos, totalViews: views[0]?.totalViews || 0, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
+app.post('/api/admin/storage-cleanup', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (_req, res, next) => { try { res.json(await cleanupOrphanedStorage()); } catch (error) { next(error); } });
 app.get('/api/admin/visits', requireAdmin, async (req, res, next) => { try {
   const days = Math.min(30, Math.max(1, Number(req.query.days) || 7)), since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
   const match = { visitedAt: { $gte: since } };
@@ -348,7 +379,7 @@ app.post('/api/upload', uploadLimiter, requireAdmin, requireSameOrigin, uploadFi
   } catch (error) { await deleteB2Objects(uploadedKeys).catch(() => {}); next(error); }
 });
 app.put('/api/videos/:id', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (req, res) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' }); const current = await Video.findById(req.params.id); if (!current) return res.status(404).json({ error: 'Video not found' }); const update = {}; ['title', 'description', 'category'].forEach(key => { if (req.body[key] != null) update[key] = clean(req.body[key], key === 'description' ? 2000 : key === 'category' ? 60 : 140); }); if (req.body.status != null) { update.targetStatus = req.body.status === 'draft' ? 'draft' : 'published'; if (current.processingStatus === 'ready') update.status = update.targetStatus; } if (req.body.tags != null) update.tags = String(req.body.tags).split(',').map(t => clean(t, 40)).filter(Boolean).slice(0, 20); const video = await Video.findByIdAndUpdate(req.params.id, { $set: update }, { new: true, runValidators: true }); res.json(video); } catch (_error) { res.status(400).json({ error: 'Invalid video data' }); } });
-app.delete('/api/videos/:id', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (req, res, next) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' }); const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); await deleteB2Objects([...new Set([video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)])]); await video.deleteOne(); res.json({ ok: true }); } catch (error) { next(error); } });
+app.delete('/api/videos/:id', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (req, res, next) => { try { if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' }); const video = await Video.findById(req.params.id); if (!video) return res.status(404).json({ error: 'Video not found' }); const storedKeys = [video.videoKey, video.thumbnailKey, ...(video.sources || []).map(source => source.key)]; await video.deleteOne(); await deleteB2Objects(storedKeys).catch(error => console.error(`B2 delete deferred for ${video._id}:`, error.message)); res.json({ ok: true }); } catch (error) { next(error); } });
 
 const seoTemplate = fs.readFileSync(path.join(__dirname, 'public', 'index.html'), 'utf8');
 const STATIC_LAST_MODIFIED = fs.statSync(path.join(__dirname, 'public', 'index.html')).mtime.toISOString();
@@ -423,6 +454,8 @@ mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 }).t
   });
   setInterval(() => resumePendingProcessing().catch(error => console.error('Processing recovery failed:', error.message)), 60000).unref();
   setInterval(() => backfillMissingDuration().catch(error => console.error('Duration recovery failed:', error.message)), 60000).unref();
+  setTimeout(() => cleanupOrphanedStorage().catch(error => console.error('Storage cleanup failed:', error.message)), 2 * 60 * 1000).unref();
+  setInterval(() => cleanupOrphanedStorage().catch(error => console.error('Storage cleanup failed:', error.message)), 24 * 60 * 60 * 1000).unref();
 }).catch(error => { console.error('MongoDB connection failed:', error.message); process.exit(1); });
 const shutdown = signal => { console.log(`${signal} received; shutting down`); server?.close(async () => { await mongoose.connection.close(); process.exit(0); }); setTimeout(() => process.exit(1), 10000).unref(); };
 process.on('SIGTERM', () => shutdown('SIGTERM')); process.on('SIGINT', () => shutdown('SIGINT'));
