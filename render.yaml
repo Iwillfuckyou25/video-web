@@ -12,7 +12,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: SITE_URL
-        value: https://video-web-0xif.onrender.com
+        value: https://s3xvideo.online
       - key: LEGAL_CONTACT_EMAIL
         sync: false
       - key: TRUST_PROXY

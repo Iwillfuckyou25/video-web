@@ -194,6 +194,7 @@ const resumePendingProcessing = async () => {
 app.disable('x-powered-by');
 app.set('trust proxy', Number(process.env.TRUST_PROXY) || 1);
 mongoose.set('strictQuery', true);
+app.use((req, res, next) => { const canonicalHost = new URL(SITE_URL).host.toLowerCase(), requestHost = String(req.get('host') || '').toLowerCase(); if (IS_PRODUCTION && ['GET', 'HEAD'].includes(req.method) && !req.path.startsWith('/api/') && requestHost && requestHost !== canonicalHost) return res.redirect(301, `${SITE_URL}${req.originalUrl}`); next(); });
 app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'", 'https://www.googletagmanager.com'], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], mediaSrc: ["'self'", 'https:'], connectSrc: ["'self'", 'https://www.google-analytics.com', 'https://region1.google-analytics.com'], objectSrc: ["'none'"], baseUri: ["'self'"], formAction: ["'self'"], frameAncestors: ["'none'"] } }, crossOriginResourcePolicy: { policy: 'cross-origin' }, referrerPolicy: { policy: 'strict-origin-when-cross-origin' }, strictTransportSecurity: IS_PRODUCTION ? { maxAge: 31536000, includeSubDomains: true, preload: true } : false }));
 app.use(compression());
 app.use(express.json({ limit: '128kb', strict: true })); app.use(express.urlencoded({ extended: false, limit: '128kb', parameterLimit: 30 }));
