@@ -142,6 +142,14 @@ const videoSchema = new mongoose.Schema({
 }, { timestamps: true });
 videoSchema.index({ title: 'text', description: 'text', category: 'text', tags: 'text' });
 const Video = mongoose.model('Video', videoSchema);
+const videoViewSchema = new mongoose.Schema({
+  videoId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
+  visitorHash: { type: String, required: true, maxlength: 64 },
+  day: { type: String, required: true, maxlength: 10 },
+  expiresAt: { type: Date, required: true, index: { expires: 0 } },
+}, { versionKey: false });
+videoViewSchema.index({ videoId: 1, visitorHash: 1, day: 1 }, { unique: true });
+const VideoView = mongoose.model('VideoView', videoViewSchema);
 const visitSchema = new mongoose.Schema({
   visitorId: { type: String, required: true, maxlength: 80, index: true },
   ip: { type: String, required: true, maxlength: 64, index: true },
@@ -332,12 +340,24 @@ app.get('/api/videos/:id/status', async (req, res, next) => { try {
 } catch (error) { next(error); } });
 app.get('/api/videos/:id', async (req, res, next) => { try {
   if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' });
-  const video = await Video.findOneAndUpdate({ _id: req.params.id, status: 'published', processingStatus: 'ready' }, { $inc: { views: 1 } }, { new: true }).lean();
+  const video = await Video.findOne({ _id: req.params.id, status: 'published', processingStatus: 'ready' }).lean();
   if (!video) return res.status(404).json({ error: 'Video not found' });
   let related = await Video.find({ _id: { $ne: video._id }, status: 'published', processingStatus: 'ready', $or: [{ category: video.category }, { tags: { $in: video.tags || [] } }] }).sort({ uploadDate: -1 }).limit(8).lean();
   if (!related.length) related = await Video.find({ _id: { $ne: video._id }, status: 'published', processingStatus: 'ready' }).sort({ uploadDate: -1 }).limit(8).lean();
   res.json({ video: await withSignedUrls(video), related: await Promise.all(related.map(withSignedUrls)) });
 } catch (error) { next(error); } });
+app.post('/api/videos/:id/view', async (req, res, next) => { try {
+  if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' });
+  const visitorId = clean(req.body?.visitorId, 80).replace(/[^a-zA-Z0-9_-]/g, '');
+  if (visitorId.length < 10) return res.status(400).json({ error: 'Invalid visitor id' });
+  const exists = await Video.exists({ _id: req.params.id, status: 'published', processingStatus: 'ready' });
+  if (!exists) return res.status(404).json({ error: 'Video not found' });
+  const day = new Date().toISOString().slice(0, 10);
+  const visitorHash = createHash('sha256').update(`${visitorId}:${clientIp(req)}:${SESSION_KEY.toString('hex')}`).digest('hex');
+  const result = await VideoView.updateOne({ videoId: req.params.id, visitorHash, day }, { $setOnInsert: { expiresAt: new Date(Date.now() + 32 * 24 * 60 * 60 * 1000) } }, { upsert: true });
+  if (result.upsertedCount) await Video.updateOne({ _id: req.params.id }, { $inc: { views: 1 } });
+  res.json({ counted: Boolean(result.upsertedCount) });
+} catch (error) { if (error?.code === 11000) return res.json({ counted: false }); next(error); } });
 app.get('/api/categories', async (_req, res, next) => { try {
   const items = await Video.aggregate([{ $match: { status: 'published', processingStatus: 'ready' } }, { $group: { _id: '$category', count: { $sum: 1 }, views: { $sum: '$views' }, thumbnailKey: { $first: '$thumbnailKey' } } }, { $sort: { count: -1 } }]);
   res.json(await Promise.all(items.map(async x => ({ name: x._id, slug: String(x._id).toLowerCase().replace(/[^a-z0-9]+/g, '-'), count: x.count, views: x.views, thumbnailUrl: x.thumbnailKey ? await signedObjectUrl(x.thumbnailKey) : '' }))));

@@ -84,6 +84,14 @@
     playButtons.forEach(button => button.addEventListener('click', event => { event.stopPropagation(); togglePlay(); }));
     video.addEventListener('click', showControls);
     video.addEventListener('play', () => { hasEnded = false; syncPlay(); });
+    video.addEventListener('play', () => {
+      if (video.dataset.viewTracked) return;
+      video.dataset.viewTracked = 'true';
+      let visitorId = localStorage.getItem('s3xVisitorId');
+      if (!visitorId) { visitorId = crypto.randomUUID(); localStorage.setItem('s3xVisitorId', visitorId); }
+      fetch(`/api/videos/${videoData._id}/view`, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visitorId }) }).catch(() => {});
+      window.gtag?.('event', 'video_start', { video_title: videoData.title, video_id: videoData._id });
+    });
     video.addEventListener('pause', () => { syncPlay(); showControls(); });
     video.addEventListener('ended', () => { hasEnded = true; syncPlay(); showControls(); });
     video.addEventListener('waiting', () => shell.classList.remove('buffering'));
