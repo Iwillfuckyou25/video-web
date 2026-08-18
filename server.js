@@ -145,10 +145,12 @@ const Video = mongoose.model('Video', videoSchema);
 const videoViewSchema = new mongoose.Schema({
   videoId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
   visitorHash: { type: String, required: true, maxlength: 64 },
-  day: { type: String, required: true, maxlength: 10 },
+  day: { type: String, required: true, maxlength: 80 },
+  playbackId: { type: String, maxlength: 80 },
   expiresAt: { type: Date, required: true, index: { expires: 0 } },
 }, { versionKey: false });
 videoViewSchema.index({ videoId: 1, visitorHash: 1, day: 1 }, { unique: true });
+videoViewSchema.index({ playbackId: 1 }, { unique: true, sparse: true });
 const VideoView = mongoose.model('VideoView', videoViewSchema);
 const visitSchema = new mongoose.Schema({
   visitorId: { type: String, required: true, maxlength: 80, index: true },
@@ -166,6 +168,13 @@ const visitSchema = new mongoose.Schema({
 }, { versionKey: false });
 visitSchema.index({ visitorId: 1, visitedAt: -1 });
 const Visit = mongoose.model('Visit', visitSchema);
+const presenceSchema = new mongoose.Schema({
+  visitorHash: { type: String, required: true, unique: true, maxlength: 64 },
+  page: { type: String, default: '/', maxlength: 300 },
+  lastSeen: { type: Date, default: Date.now, index: true },
+  expiresAt: { type: Date, required: true, index: { expires: 0 } },
+}, { versionKey: false });
+const Presence = mongoose.model('Presence', presenceSchema);
 const clientIp = req => String(req.ip || req.socket?.remoteAddress || '').replace(/^::ffff:/, '').slice(0, 64);
 const userAgentInfo = value => { const ua = String(value || ''); let browser = 'Other'; if (/Edg\//i.test(ua)) browser = 'Edge'; else if (/OPR\//i.test(ua)) browser = 'Opera'; else if (/Chrome\//i.test(ua)) browser = 'Chrome'; else if (/Firefox\//i.test(ua)) browser = 'Firefox'; else if (/Safari\//i.test(ua)) browser = 'Safari'; let os = 'Other'; if (/Windows/i.test(ua)) os = 'Windows'; else if (/Android/i.test(ua)) os = 'Android'; else if (/iPhone|iPad|iPod/i.test(ua)) os = 'iOS'; else if (/Mac OS/i.test(ua)) os = 'macOS'; else if (/Linux/i.test(ua)) os = 'Linux'; const device = /iPad|Tablet/i.test(ua) ? 'Tablet' : /Mobile|Android|iPhone|iPod/i.test(ua) ? 'Mobile' : 'Desktop'; return { browser, os, device }; };
 const activeProcessing = new Set();
@@ -285,6 +294,8 @@ const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, skipSuccess
 const adminWriteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many admin changes. Try again later.' } });
 const uploadLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 12, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Upload limit reached. Try again later.' } });
 const visitLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Visit limit reached.' } });
+const presenceLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 180, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Presence limit reached.' } });
+const viewLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'View limit reached.' } });
 const b2UploadStorage = {
   _handleFile(_req, file, cb) {
     const id = randomUUID();
@@ -322,6 +333,16 @@ app.post('/api/visits', visitLimiter, requireSameOrigin, async (req, res, next) 
   await Visit.create({ visitorId, ip: clientIp(req), page, referrer: clean(req.body?.referrer, 500), userAgent: agent, ...info, language: clean(req.body?.language, 20), screen: clean(req.body?.screen, 20), expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) });
   res.status(204).end();
 } catch (error) { next(error); } });
+app.post('/api/presence', presenceLimiter, requireSameOrigin, async (req, res, next) => { try {
+  const page = clean(req.body?.page, 300);
+  if (!page.startsWith('/') || page.startsWith('/admin')) return res.status(204).end();
+  const visitorId = clean(req.body?.visitorId, 80).replace(/[^a-zA-Z0-9_-]/g, '');
+  if (visitorId.length < 10) return res.status(400).json({ error: 'Invalid visitor id' });
+  const visitorHash = createHash('sha256').update(`${visitorId}:${SESSION_KEY.toString('hex')}`).digest('hex');
+  const now = new Date();
+  await Presence.updateOne({ visitorHash }, { $set: { page, lastSeen: now, expiresAt: new Date(now.getTime() + 5 * 60 * 1000) } }, { upsert: true });
+  res.status(204).end();
+} catch (error) { next(error); } });
 app.get('/api/videos', async (req, res, next) => { try {
   const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(48, Math.max(1, Number(req.query.limit) || 12));
   const filter = { status: 'published', processingStatus: 'ready' };
@@ -346,24 +367,30 @@ app.get('/api/videos/:id', async (req, res, next) => { try {
   if (!related.length) related = await Video.find({ _id: { $ne: video._id }, status: 'published', processingStatus: 'ready' }).sort({ uploadDate: -1 }).limit(8).lean();
   res.json({ video: await withSignedUrls(video), related: await Promise.all(related.map(withSignedUrls)) });
 } catch (error) { next(error); } });
-app.post('/api/videos/:id/view', async (req, res, next) => { try {
+app.post('/api/videos/:id/view', viewLimiter, requireSameOrigin, async (req, res, next) => { try {
   if (!mongoose.isObjectIdOrHexString(req.params.id)) return res.status(400).json({ error: 'Invalid video id' });
   const visitorId = clean(req.body?.visitorId, 80).replace(/[^a-zA-Z0-9_-]/g, '');
-  if (visitorId.length < 10) return res.status(400).json({ error: 'Invalid visitor id' });
-  const exists = await Video.exists({ _id: req.params.id, status: 'published', processingStatus: 'ready' });
-  if (!exists) return res.status(404).json({ error: 'Video not found' });
-  const day = new Date().toISOString().slice(0, 10);
+  const playbackId = clean(req.body?.playbackId, 80).replace(/[^a-zA-Z0-9_-]/g, '');
+  const watchedSeconds = Math.max(0, Number(req.body?.watchedSeconds) || 0);
+  if (visitorId.length < 10 || playbackId.length < 10) return res.status(400).json({ error: 'Invalid playback data' });
+  const video = await Video.findOne({ _id: req.params.id, status: 'published', processingStatus: 'ready' }).select('duration').lean();
+  if (!video) return res.status(404).json({ error: 'Video not found' });
+  const requiredSeconds = Math.min(10, Math.max(3, Number(video.duration || 0) * 0.25));
+  if (watchedSeconds < requiredSeconds) return res.status(400).json({ error: 'Playback is not yet eligible for a view' });
+  const datePrefix = new Date().toISOString().slice(0, 10);
   const visitorHash = createHash('sha256').update(`${visitorId}:${clientIp(req)}:${SESSION_KEY.toString('hex')}`).digest('hex');
-  const result = await VideoView.updateOne({ videoId: req.params.id, visitorHash, day }, { $setOnInsert: { expiresAt: new Date(Date.now() + 32 * 24 * 60 * 60 * 1000) } }, { upsert: true });
-  if (result.upsertedCount) await Video.updateOne({ _id: req.params.id }, { $inc: { views: 1 } });
-  res.json({ counted: Boolean(result.upsertedCount) });
+  const dailyPlays = await VideoView.countDocuments({ videoId: req.params.id, visitorHash, day: new RegExp(`^${datePrefix}`) });
+  if (dailyPlays >= 10) return res.json({ counted: false, reason: 'daily-limit' });
+  await VideoView.create({ videoId: req.params.id, visitorHash, day: `${datePrefix}:${playbackId}`, playbackId, expiresAt: new Date(Date.now() + 32 * 24 * 60 * 60 * 1000) });
+  await Video.updateOne({ _id: req.params.id }, { $inc: { views: 1 } });
+  res.json({ counted: true });
 } catch (error) { if (error?.code === 11000) return res.json({ counted: false }); next(error); } });
 app.get('/api/categories', async (_req, res, next) => { try {
   const items = await Video.aggregate([{ $match: { status: 'published', processingStatus: 'ready' } }, { $group: { _id: '$category', count: { $sum: 1 }, views: { $sum: '$views' }, thumbnailKey: { $first: '$thumbnailKey' } } }, { $sort: { count: -1 } }]);
   res.json(await Promise.all(items.map(async x => ({ name: x._id, slug: String(x._id).toLowerCase().replace(/[^a-z0-9]+/g, '-'), count: x.count, views: x.views, thumbnailUrl: x.thumbnailKey ? await signedObjectUrl(x.thumbnailKey) : '' }))));
 } catch (error) { next(error); } });
 app.get('/api/admin/videos/:id', requireAdmin, async (req, res) => { try { const video = await Video.findById(req.params.id).lean(); if (!video) return res.status(404).json({ error: 'Video not found' }); res.json({ video: await withSignedUrls(video) }); } catch (_error) { res.status(400).json({ error: 'Invalid video id' }); } });
-app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const ready = { processingStatus: 'ready' }; const [totalVideos, readyVideos, views, latest] = await Promise.all([Video.countDocuments({}), Video.countDocuments(ready), Video.aggregate([{ $match: ready }, { $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find({}).sort({ uploadDate: -1 }).limit(20).lean()]); res.json({ totalVideos, readyVideos, totalViews: views[0]?.totalViews || 0, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
+app.get('/api/admin/stats', requireAdmin, async (_req, res, next) => { try { const ready = { processingStatus: 'ready' }; const now = new Date(), today = new Date(now); today.setHours(0, 0, 0, 0); const recentStart = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000); const [totalVideos, readyVideos, views, latest, activeNow, visitorsToday, visitors30Days, visits30Days] = await Promise.all([Video.countDocuments({}), Video.countDocuments(ready), Video.aggregate([{ $match: ready }, { $group: { _id: null, totalViews: { $sum: '$views' } } }]), Video.find({}).sort({ uploadDate: -1 }).limit(20).lean(), Presence.countDocuments({ lastSeen: { $gte: new Date(now.getTime() - 2 * 60 * 1000) } }), Visit.distinct('visitorId', { visitedAt: { $gte: today } }), Visit.distinct('visitorId', { visitedAt: { $gte: recentStart } }), Visit.countDocuments({ visitedAt: { $gte: recentStart } })]); res.json({ totalVideos, readyVideos, totalViews: views[0]?.totalViews || 0, activeNow, uniqueVisitorsToday: visitorsToday.length, uniqueVisitors30Days: visitors30Days.length, visits30Days, latest: await Promise.all(latest.map(withSignedUrls)), storage: 'Private Backblaze B2' }); } catch (error) { next(error); } });
 app.post('/api/admin/storage-cleanup', adminWriteLimiter, requireAdmin, requireSameOrigin, requireCsrf, async (_req, res, next) => { try { res.json(await cleanupOrphanedStorage()); } catch (error) { next(error); } });
 app.get('/api/admin/visits', requireAdmin, async (req, res, next) => { try {
   const days = Math.min(30, Math.max(1, Number(req.query.days) || 7)), since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);

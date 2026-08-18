@@ -54,6 +54,26 @@
     let lastTap = 0;
     let seeking = false;
     let hasEnded = false;
+    let playbackId = '';
+    let watchedSeconds = 0;
+    let lastPlaybackTime = 0;
+    let viewSubmitted = false;
+
+    const ensurePlayback = () => {
+      if (!playbackId) playbackId = crypto.randomUUID();
+      lastPlaybackTime = video.currentTime;
+    };
+    const submitQualifiedView = () => {
+      if (viewSubmitted) return;
+      const duration = Number(video.duration || videoData.duration || 0);
+      const requiredSeconds = Math.min(10, Math.max(3, duration * 0.25));
+      if (watchedSeconds < requiredSeconds) return;
+      viewSubmitted = true;
+      let visitorId = localStorage.getItem('s3xVisitorId');
+      if (!visitorId) { visitorId = crypto.randomUUID(); localStorage.setItem('s3xVisitorId', visitorId); }
+      fetch(`/api/videos/${videoData._id}/view`, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visitorId, playbackId, watchedSeconds }) }).catch(() => {});
+      window.gtag?.('event', 'video_view', { video_title: videoData.title, video_id: videoData._id });
+    };
 
     const togglePlay = () => {
       if (hasEnded || video.ended) { video.currentTime = 0; hasEnded = false; return video.play(); }
@@ -83,17 +103,14 @@
 
     playButtons.forEach(button => button.addEventListener('click', event => { event.stopPropagation(); togglePlay(); }));
     video.addEventListener('click', showControls);
-    video.addEventListener('play', () => { hasEnded = false; syncPlay(); });
     video.addEventListener('play', () => {
-      if (video.dataset.viewTracked) return;
-      video.dataset.viewTracked = 'true';
-      let visitorId = localStorage.getItem('s3xVisitorId');
-      if (!visitorId) { visitorId = crypto.randomUUID(); localStorage.setItem('s3xVisitorId', visitorId); }
-      fetch(`/api/videos/${videoData._id}/view`, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visitorId }) }).catch(() => {});
+      hasEnded = false;
+      ensurePlayback();
+      syncPlay();
       window.gtag?.('event', 'video_start', { video_title: videoData.title, video_id: videoData._id });
     });
     video.addEventListener('pause', () => { syncPlay(); showControls(); });
-    video.addEventListener('ended', () => { hasEnded = true; syncPlay(); showControls(); });
+    video.addEventListener('ended', () => { submitQualifiedView(); playbackId = ''; watchedSeconds = 0; lastPlaybackTime = 0; viewSubmitted = false; hasEnded = true; syncPlay(); showControls(); });
     video.addEventListener('waiting', () => shell.classList.remove('buffering'));
     video.addEventListener('stalled', () => shell.classList.remove('buffering'));
     video.addEventListener('playing', () => { shell.classList.remove('buffering'); syncPlay(); showControls(); });
@@ -106,10 +123,17 @@
     });
     video.addEventListener('durationchange', syncDuration);
     video.addEventListener('timeupdate', () => {
+      if (!video.paused && !seeking && playbackId) {
+        const delta = video.currentTime - lastPlaybackTime;
+        if (delta > 0 && delta <= 2) watchedSeconds += delta;
+        lastPlaybackTime = video.currentTime;
+        submitQualifiedView();
+      }
       if (!seeking && video.duration) seek.value = Math.round(video.currentTime / video.duration * 1000);
       clock.textContent = `${timeText(video.currentTime)} / ${timeText(video.duration)}`;
       localStorage.setItem(`resume:${videoData._id}`, video.currentTime);
     });
+    video.addEventListener('seeking', () => { lastPlaybackTime = video.currentTime; });
     seek.addEventListener('input', () => { seeking = true; if (video.duration) clock.textContent = `${timeText(seek.value / 1000 * video.duration)} / ${timeText(video.duration)}`; });
     seek.addEventListener('change', () => { if (video.duration) video.currentTime = seek.value / 1000 * video.duration; seeking = false; });
     volume.addEventListener('input', () => { video.volume = Number(volume.value); video.muted = false; mute.textContent = video.volume ? '🔊' : '🔇'; });
